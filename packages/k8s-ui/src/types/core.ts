@@ -33,9 +33,25 @@ export interface Capabilities {
   helmWrite: boolean      // Helm write operations (install, upgrade, rollback, uninstall, apply values)
   nodeWrite: boolean      // Node write operations (cordon, uncordon, drain)
   mcpEnabled: boolean     // MCP server is running
+  // How / where this Radar binary is running. Optional on the wire so a
+  // newer frontend (e.g. radar-hub-web bundling a fresher @skyhook-io/radar-app)
+  // doesn't crash against an older backend that hasn't shipped the field yet —
+  // consumers should default to { mode: 'local' } when absent.
+  deployment?: Deployment
   resources?: ResourcePermissions // Per-resource-type permissions
   authEnabled?: boolean   // Auth is enabled on the backend
   username?: string       // Authenticated user's username (when auth enabled)
+}
+
+// DeploymentMode is the closed set of topologies Radar can run in.
+// `local` is a developer's machine with a kubeconfig (most OSS use).
+// `in-cluster` is a Radar pod inside the cluster, no kubeconfig.
+// `cloud` is in-cluster + tunneled to Radar Cloud's hub — UI suppresses
+// chrome the hub already renders (cluster headline, local-MCP card).
+export type DeploymentMode = 'local' | 'in-cluster' | 'cloud'
+
+export interface Deployment {
+  mode: DeploymentMode
 }
 
 // Core node kinds that have specific UI handling

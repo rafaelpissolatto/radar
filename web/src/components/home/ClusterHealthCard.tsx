@@ -12,6 +12,9 @@ import { useCapabilitiesContext } from '../../contexts/CapabilitiesContext'
 import { MCPSetupDialog } from './MCPSetupDialog'
 import { pluralize, parseContextName } from '@skyhook-io/k8s-ui'
 import { Tooltip } from '../ui/Tooltip'
+import gkeIcon from '../../assets/platform-icons/google_kubernetes_engine.png'
+import eksIcon from '../../assets/platform-icons/aws_eks.png'
+import aksIcon from '../../assets/platform-icons/azure-aks.svg'
 
 interface ClusterHealthCardProps {
   health: DashboardResponse['health']
@@ -67,13 +70,13 @@ function MetricsUnavailableHint({ platform, metricsServerAvailable }: { platform
 function getPlatformInfo(platform: string): { name: string; icon: string | null } {
   const platformLower = platform.toLowerCase()
   if (platformLower.includes('gke') || platformLower.includes('google')) {
-    return { name: 'Google Kubernetes Engine', icon: '/icons/google_kubernetes_engine.png' }
+    return { name: 'Google Kubernetes Engine', icon: gkeIcon }
   }
   if (platformLower.includes('eks') || platformLower.includes('amazon') || platformLower.includes('aws')) {
-    return { name: 'Amazon EKS', icon: '/icons/aws_eks.png' }
+    return { name: 'Amazon EKS', icon: eksIcon }
   }
   if (platformLower.includes('aks') || platformLower.includes('azure')) {
-    return { name: 'Azure Kubernetes Service', icon: '/icons/azure-aks.svg' }
+    return { name: 'Azure Kubernetes Service', icon: aksIcon }
   }
   if (platformLower.includes('openshift')) {
     return { name: 'OpenShift', icon: null }
@@ -93,7 +96,14 @@ function getPlatformInfo(platform: string): { name: string; icon: string | null 
   if (platformLower.includes('docker')) {
     return { name: 'Docker Desktop', icon: null }
   }
-  return { name: platform || 'Kubernetes', icon: null }
+  // The Go backend returns "generic" for unrecognized platforms — that
+  // literal string is no better than the empty case, so fall back to
+  // the friendlier "Kubernetes" label for both. Only pass the platform
+  // string through when it's actually a recognizable name.
+  if (!platform || platformLower === 'generic') {
+    return { name: 'Kubernetes', icon: null }
+  }
+  return { name: platform, icon: null }
 }
 
 export function ClusterHealthCard({
@@ -113,8 +123,20 @@ export function ClusterHealthCard({
   void _topCRDs // Reserved for future CRD display
 
   const [mcpDialogOpen, setMcpDialogOpen] = useState(false)
-  const { mcpEnabled } = useCapabilitiesContext()
+  const caps = useCapabilitiesContext()
+  // Default to local mode when the backend doesn't ship a `deployment`
+  // field (older Radar binaries pre-0.2.2). Local rendering is the safe
+  // OSS-shape default — wrong-direction defaults would briefly suppress
+  // chrome OSS users expect to see.
+  const deployment = caps.deployment ?? { mode: 'local' as const }
+  const mcpEnabled = caps.mcpEnabled
+  const isCloud = deployment.mode === 'cloud'
+  const isInCluster = deployment.mode === 'in-cluster' || deployment.mode === 'cloud'
   const mcpUrl = `${window.location.origin}/mcp`
+  // In Cloud, MCP is org-wide and PAT-authed (api.radarhq.io/mcp). The OSS
+  // "this binary is your local MCP server" framing is wrong there — Cloud
+  // surfaces MCP from the hub Home dashboard instead.
+  const showLocalMcpCard = mcpEnabled && !isCloud
 
   const restricted = counts.restricted ?? []
   const isRestricted = (kind: string) => restricted.includes(kind)
@@ -158,13 +180,23 @@ export function ClusterHealthCard({
     { kind: 'cronjobs', label: 'CronJobs', icon: Clock, total: counts.cronJobs.total, subtitle: `${counts.cronJobs.active} active` },
   ]
   const platformInfo = getPlatformInfo(cluster.platform)
-  // The raw cluster.name is the kubeconfig context (e.g.
-  // `gke_koalabackend_us-east1-b_nonprod-cluster-us-east1`). That string
-  // is the user's primary orientation cue, but the bit they actually
-  // recognize is the short clusterName. We promote that, push the raw
-  // path into a tooltip, and surface project/region as muted metadata.
+  // Headline-name derivation has three branches, in priority order:
+  //  1. Local-kubeconfig users get the parsed short clusterName from a
+  //     string like `gke_koalabackend_us-east1-b_nonprod-cluster-us-east1`
+  //     (the meaningful tail). Account/region are surfaced separately
+  //     below as muted metadata, and the raw path is exposed via tooltip
+  //     on the headline element.
+  //  2. In-cluster mode (deployment.mode === 'in-cluster' OR 'cloud')
+  //     has no meaningful kubeconfig context — bootstrap sets it to
+  //     the literal "in-cluster" sentinel. Fall back to the platform
+  //     label ("Google Kubernetes Engine") which IS recognizable.
+  //  3. Last resort: the literal cluster.name, or "Cluster".
+  // When the card is rendered embedded (cloud mode), the H2 itself is
+  // suppressed below — the hub shell already shows the cluster name in
+  // its top bar.
   const parsedContext = parseContextName(cluster.name || '')
-  const headlineName = parsedContext.clusterName || cluster.name || 'Cluster'
+  const rawHeadline = parsedContext.clusterName || cluster.name || 'Cluster'
+  const headlineName = isInCluster ? platformInfo.name : rawHeadline
 
   return (
     <div className="rounded-xl bg-theme-surface shadow-theme-sm overflow-hidden">
@@ -181,12 +213,23 @@ export function ClusterHealthCard({
               )}
               <span className="text-xs text-theme-text-secondary truncate">{platformInfo.name}</span>
             </div>
-            <h2
-              className="text-xl font-semibold text-theme-text-primary truncate mb-1.5 leading-tight"
-              title={cluster.name}
-            >
-              {headlineName}
-            </h2>
+            {/* In Cloud, the hub shell already shows the cluster name in
+                its top bar; rendering it again here is redundant and
+                makes the card feel like a label rather than content. */}
+            {!isCloud && (
+              <h2
+                className="text-xl font-semibold text-theme-text-primary truncate mb-1.5 leading-tight"
+                // In-cluster mode's cluster.name is the literal "in-cluster"
+                // sentinel, which would leak via the browser hover tooltip
+                // even though the visible text falls back to the platform
+                // label. Drop the title attribute entirely in that case;
+                // local mode keeps it so users can hover to see the full
+                // kubeconfig context path.
+                title={isInCluster ? undefined : cluster.name}
+              >
+                {headlineName}
+              </h2>
+            )}
             <div className="flex flex-col gap-0.5 text-xs text-theme-text-tertiary">
               {(parsedContext.account || parsedContext.region) && (
                 <span className="truncate font-mono" title={[parsedContext.account, parsedContext.region].filter(Boolean).join(' · ')}>
@@ -197,7 +240,11 @@ export function ClusterHealthCard({
                 <span>Kubernetes {cluster.version}</span>
               )}
               <span><span className="font-mono">{counts.namespaces}</span> namespaces</span>
-              {cluster.name && cluster.name !== headlineName && (
+              {/* Show raw kubeconfig context as muted metadata only when
+                  it differs from the headline AND we're in local mode
+                  (in-cluster has no meaningful context name, cloud
+                  shell already renders the canonical name). */}
+              {cluster.name && cluster.name !== headlineName && deployment.mode === 'local' && (
                 <span
                   className="font-mono text-[10px] text-theme-text-disabled break-all leading-snug pt-0.5"
                   title={cluster.name}
@@ -229,8 +276,11 @@ export function ClusterHealthCard({
                 </span>
               </Tooltip>
             )}
-            {/* MCP Server indicator */}
-            {mcpEnabled && (
+            {/* MCP Server indicator. OSS-only: in Cloud, MCP discovery
+                lives at the hub level (org-wide endpoint, PAT-authed)
+                rather than per-cluster, so this localhost/no-auth card
+                would mislead a Cloud user. */}
+            {showLocalMcpCard && (
               <button
                 onClick={() => setMcpDialogOpen(true)}
                 className="flex items-center gap-2 mt-3 px-2.5 py-2 bg-purple-500/5 hover:bg-purple-500/10 border border-purple-500/20 rounded-md transition-colors w-full"
