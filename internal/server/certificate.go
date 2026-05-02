@@ -58,18 +58,17 @@ type DashboardCertificateHealth struct {
 	Expired  int `json:"expired"`
 }
 
-// getDashboardCertificateHealth scans all TLS secrets and counts by expiry bucket.
-func (s *Server) getDashboardCertificateHealth(namespace string) *DashboardCertificateHealth {
+// getDashboardCertificateHealth scans TLS secrets in the given
+// namespaces and counts by expiry bucket. nil namespaces means
+// "every namespace the cache exposes"; an empty slice means none
+// (matches the MatchesNamespace contract used throughout this package).
+func (s *Server) getDashboardCertificateHealth(namespaces []string) *DashboardCertificateHealth {
 	cache := k8s.GetResourceCache()
 	if cache == nil {
 		return nil
 	}
 
 	provider := k8s.NewTopologyResourceProvider(cache)
-	var namespaces []string
-	if namespace != "" {
-		namespaces = []string{namespace}
-	}
 
 	expiry, err := topology.GetCertificateExpiry(provider, namespaces)
 	if err != nil {
