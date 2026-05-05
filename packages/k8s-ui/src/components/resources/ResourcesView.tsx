@@ -3471,7 +3471,7 @@ export function ResourcesView({
           {lastUpdated && (
             <div className="flex items-center gap-1.5 text-xs text-theme-text-tertiary">
               <Clock className="w-3.5 h-3.5" />
-              <span>Updated {formatAge(lastUpdated.toISOString())}</span>
+              <span>Updated <span className="inline-block min-w-[4ch] tabular-nums">{formatAge(lastUpdated.toISOString())}</span></span>
             </div>
           )}
           {/* Column picker */}
