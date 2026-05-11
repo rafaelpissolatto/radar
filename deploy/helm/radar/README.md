@@ -53,6 +53,30 @@ helm upgrade --install radar skyhook/radar \
   --set ingress.tls[0].hosts[0]=radar.example.com
 ```
 
+### Connecting to Radar Cloud
+
+To connect Radar to Radar Cloud (hosted SaaS), follow the install wizard at
+[radarhq.io](https://radarhq.io) — it generates the full command with your
+cluster's bearer token. The wizard's command follows this shape:
+
+```bash
+kubectl create namespace radar --dry-run=client -o yaml | kubectl apply -f -
+kubectl create secret generic radar-cloud-config -n radar \
+  --from-literal=token=$TOKEN \
+  --dry-run=client -o yaml | kubectl apply -f -
+helm upgrade --install radar skyhook/radar -n radar \
+  --set cloud.enabled=true \
+  --set cloud.url=wss://api.radarhq.io/agent \
+  --set cloud.clusterName=$CLUSTER_NAME \
+  --set cloud.existingSecret=radar-cloud-config
+```
+
+The `radar-cloud-config` Secret is managed independently of Helm, so token
+rotation is one `kubectl apply` — no `helm upgrade` required. The same
+applies to GitOps users: manage the Secret with SealedSecrets / SOPS /
+External Secrets and reference it via `cloud.existingSecret`; Helm never
+touches its contents.
+
 ## Configuration
 
 | Parameter | Description | Default |

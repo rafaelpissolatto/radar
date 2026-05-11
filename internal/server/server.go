@@ -267,6 +267,17 @@ func (s *Server) setupRoutes() {
 			// releases, workload labels, CRD registrations, and GitOps
 			// declarations. See pkg/packages for merge semantics.
 			r.Get("/packages", s.handleListPackages)
+
+			// Free-text resource search (name + namespace + labels +
+			// annotations + container images). Used by the hub fan-out
+			// for cross-cluster search; safe to call directly per-cluster.
+			r.Get("/search", s.handleSearch)
+
+			// Unified cluster-health endpoint — composes problems +
+			// audit findings + warning events + generic CRD condition
+			// fallback into one normalized list. Used by the hub
+			// fan-out for cross-cluster issues.
+			r.Get("/issues", s.handleIssues)
 			r.Get("/settings/audit", s.handleGetAuditSettings)
 			r.Put("/settings/audit", s.handlePutAuditSettings)
 			r.Get("/events", s.handleEvents)

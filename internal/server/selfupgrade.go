@@ -15,6 +15,27 @@ import (
 	"github.com/skyhook-io/radar/internal/k8s"
 )
 
+// selfUpgradePatchOptions returns the PatchOptions used by the self-upgrade
+// endpoint. FieldManager "helm" is what keeps `.image` ownership stable
+// across self-upgrade and `helm upgrade` cycles: with an empty FieldManager
+// the apiserver derives one from User-Agent → "radar", which then
+// permanently owns .image and breaks every subsequent helm upgrade with a
+// server-side-apply conflict.
+//
+// We deliberately do NOT set Force here. K8s apimachinery rejects Force on
+// non-Apply patches (apimachinery/pkg/apis/meta/v1/validation:
+// `field.Forbidden("force", "may not be specified for non-apply patch")`)
+// so a StrategicMergePatch with Force=true returns 422 Invalid and the
+// upgrade never runs. If we ever need to reclaim conflicting ownership,
+// the route is to switch the request to ApplyPatchType with a full apply
+// object — not to flip Force back on a strategic merge.
+//
+// Extracted for tripwire test; if a refactor reverts these values, the
+// test in selfupgrade_test.go fails before the bug ships.
+func selfUpgradePatchOptions() metav1.PatchOptions {
+	return metav1.PatchOptions{FieldManager: "helm"}
+}
+
 // handleSelfUpgrade patches this Radar Deployment's container image so the
 // pod restarts on a new version. Called by Radar Cloud's upgrade-agent endpoint
 // over the yamux tunnel — no user terminal or cloud credentials needed.
@@ -72,19 +93,28 @@ func (s *Server) handleSelfUpgrade(w http.ResponseWriter, r *http.Request) {
 		deployment,
 		types.StrategicMergePatchType,
 		patch,
-		metav1.PatchOptions{},
+		selfUpgradePatchOptions(),
 	)
 	if err != nil {
-		if apierrors.IsNotFound(err) {
+		switch {
+		case apierrors.IsNotFound(err):
 			s.writeError(w, http.StatusNotFound, "deployment not found")
-			return
-		}
-		if apierrors.IsForbidden(err) {
+		case apierrors.IsForbidden(err):
 			s.writeError(w, http.StatusForbidden, "SA lacks patch permission on this Deployment (rbac.selfUpgrade=true?)")
-			return
+		case apierrors.IsConflict(err):
+			// A concurrent helm upgrade or apply can race the patch.
+			// Retryable on the caller's side. (We could reclaim
+			// ownership via server-side apply, but the StrategicMerge
+			// path keeps the request small and a retry is cheap.)
+			s.writeError(w, http.StatusConflict, "concurrent modification, retry")
+		case apierrors.IsTooManyRequests(err) || apierrors.IsServerTimeout(err):
+			s.writeError(w, http.StatusServiceUnavailable, "apiserver throttled, retry")
+		case apierrors.IsInvalid(err):
+			s.writeError(w, http.StatusBadRequest, "invalid patch")
+		default:
+			log.Printf("[self-upgrade] patch failed: ns=%s deploy=%s tag=%s err=%v", ns, deployment, tag, err)
+			s.writeError(w, http.StatusInternalServerError, "patch failed")
 		}
-		log.Printf("[self-upgrade] patch failed: ns=%s deploy=%s tag=%s err=%v", ns, deployment, tag, err)
-		s.writeError(w, http.StatusInternalServerError, "patch failed")
 		return
 	}
 
