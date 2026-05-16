@@ -290,10 +290,14 @@ func (d *DynamicResourceCache) factoryForGVR(gvr schema.GroupVersionResource) dy
 	return d.factory
 }
 
-// probeCount does a quick list with limit=1 and returns the approximate resource count.
+// ProbeCount does a quick list with limit=1 and returns the approximate resource count.
 // Returns -1 if access is denied, -2 if the probe failed for non-auth reasons (caller
 // should defer), or the count (items + remainingItemCount) on success.
-func (d *DynamicResourceCache) probeCount(gvr schema.GroupVersionResource) int {
+//
+// Exported so callers outside this package (e.g. internal/k8s when deciding
+// whether to eager-warm high-cardinality CRDs like PolicyReports) can gate
+// informer creation on cluster size before paying the watch-layer cost.
+func (d *DynamicResourceCache) ProbeCount(gvr schema.GroupVersionResource) int {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -945,7 +949,7 @@ func (d *DynamicResourceCache) DiscoverAllCRDs() {
 						results <- probeResult{gvr: g, count: -1}
 					}
 				}()
-				count := d.probeCount(g)
+				count := d.ProbeCount(g)
 				results <- probeResult{gvr: g, count: count}
 			}(gvr)
 		}
@@ -1059,6 +1063,37 @@ func (d *DynamicResourceCache) GetInformerCount() int {
 	defer d.mu.RUnlock()
 
 	return len(d.informers)
+}
+
+// AddGVRChangeHandler registers a change handler on the informer for the
+// given GVR. The handler fires for add/update/delete events (including the
+// initial sync). Returns an error if no informer exists yet for the GVR —
+// callers should warm up or EnsureWatching the resource before registering.
+//
+// Used by derived caches (PolicyReport index, etc.) that need to react to
+// changes on a single resource kind without subscribing to the global
+// OnChange callback (which would fire for every dynamic resource).
+//
+// The handler runs on the informer's event-processing goroutine; it must
+// be non-blocking. A panic in the handler is contained by the upstream
+// informer machinery (no impact on other handlers).
+func (d *DynamicResourceCache) AddGVRChangeHandler(gvr schema.GroupVersionResource, handler cache.ResourceEventHandler) error {
+	if d == nil {
+		return fmt.Errorf("dynamic resource cache not initialized")
+	}
+
+	d.mu.RLock()
+	informer, exists := d.informers[gvr]
+	d.mu.RUnlock()
+
+	if !exists {
+		return fmt.Errorf("no informer for %s.%s/%s; warm up the resource before registering a handler", gvr.Resource, gvr.Group, gvr.Version)
+	}
+
+	if _, err := informer.AddEventHandler(handler); err != nil {
+		return fmt.Errorf("add event handler for %v: %w", gvr, err)
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
