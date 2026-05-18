@@ -63,6 +63,19 @@ func registerTools(server *mcp.Server) {
 	}, logToolCall("get_topology", handleGetTopology))
 
 	mcp.AddTool(server, &mcp.Tool{
+		Name: "get_neighborhood",
+		Description: "Get the BFS-expanded neighborhood of a specific resource — the slice " +
+			"of the topology graph immediately relevant to one root. Cheaper and more " +
+			"focused than get_topology when you already know which resource you care " +
+			"about. Profile is 'auto' (default — picks a bounded edge set from the root " +
+			"kind) or 'all' (every edge type). Hops controls BFS depth (default 1, max " +
+			"2). Nodes are RBAC-filtered against the caller; dropped neighbors are " +
+			"listed in `omitted` with reason=rbac_denied. If max_nodes is exceeded " +
+			"mid-expansion, truncated=true is set and a partial subgraph is returned.",
+		Annotations: readOnly,
+	}, logToolCall("get_neighborhood", handleGetNeighborhood))
+
+	mcp.AddTool(server, &mcp.Tool{
 		Name: "get_events",
 		Description: "Get recent Kubernetes warning events, deduplicated and sorted by recency. " +
 			"Useful for diagnosing issues — shows event reason, message, and occurrence count.",
@@ -831,50 +844,16 @@ func handleGetTopology(ctx context.Context, req *mcp.CallToolRequest, input topo
 	return toJSONResult(topo)
 }
 
-// clusterScopedTopologyKinds maps topology NodeKinds for cluster-scoped
-// resources to the (group, resource) tuple a SAR needs. Topology pulls
-// these from the SA-populated cache regardless of the caller's namespace
-// scope, so callers without per-kind RBAC must have them stripped.
-//
-// This is a denylist: it must enumerate every cluster-scoped kind the
-// topology builder creates. Drift here = silent leak. See the checklist
-// comment on NodeKind in pkg/topology/types.go and the planned scope-
-// driven follow-up that removes the central table.
-//
-// KindNamespace is intentionally excluded — handled by per-user filter
-// upstream. KindNodeClass has multiple entries (one per cloud provider)
-// because the topology builder iterates EC2NodeClass / AKSNodeClass /
-// GCPNodeClass under the same NodeKind label; a denial on any provider
-// strips all NodeClass nodes. canReadClusterScopedKind's unknown-kind
-// passthrough makes providers absent from the cluster's discovery
-// non-blocking.
-var clusterScopedTopologyKinds = []struct {
-	kind     topology.NodeKind
-	group    string
-	resource string
-}{
-	{topology.KindNode, "", "nodes"},
-	{topology.KindNodePool, "karpenter.sh", "nodepools"},
-	{topology.KindNodeClaim, "karpenter.sh", "nodeclaims"},
-	{topology.KindNodeClass, "karpenter.k8s.aws", "ec2nodeclasses"},
-	{topology.KindNodeClass, "karpenter.azure.com", "aksnodeclasses"},
-	{topology.KindNodeClass, "karpenter.k8s.gcp", "gcpnodeclasses"},
-	{topology.KindGatewayClass, "gateway.networking.k8s.io", "gatewayclasses"},
-	{topology.KindPV, "", "persistentvolumes"},
-	{topology.KindStorageClass, "storage.k8s.io", "storageclasses"},
-	{topology.KindCiliumClusterwideNetworkPolicy, "cilium.io", "ciliumclusterwidenetworkpolicies"},
-	{topology.KindClusterNetworkPolicy, "policy.networking.k8s.io", "clusternetworkpolicies"},
-}
-
 // deniedClusterScopedTopoKinds returns the set of cluster-scoped topology
-// NodeKinds the calling user cannot list. Reuses canReadClusterScopedKind's
-// per-user canI cache so subsequent topology calls within the same TTL
-// don't re-SAR.
+// NodeKinds the calling user cannot list. Walks topology.ClusterScopedKinds
+// (centralized table — see pkg/topology/cluster_scoped_kinds.go). Reuses
+// canReadClusterScopedKind's per-user canI cache so subsequent topology
+// calls within the same TTL don't re-SAR.
 func deniedClusterScopedTopoKinds(ctx context.Context) map[topology.NodeKind]bool {
 	deny := make(map[topology.NodeKind]bool)
-	for _, ck := range clusterScopedTopologyKinds {
-		if !canReadClusterScopedKind(ctx, ck.resource, ck.group, "list") {
-			deny[ck.kind] = true
+	for _, ck := range topology.ClusterScopedKinds {
+		if !canReadClusterScopedKind(ctx, ck.Resource, ck.Group, "list") {
+			deny[ck.Kind] = true
 		}
 	}
 	return deny
