@@ -47,9 +47,15 @@ export interface WorkloadLogsViewerProps {
   overrideDownload?: (content: string, mime: string, filename: string) => void
   /** Force dark mode on the logs container (default: true) */
   forceDark?: boolean
+  /**
+   * Open the stream automatically on mount (and on container switch) instead of
+   * loading a static snapshot. The user can still Stop, and a manual Stop is not
+   * re-armed. Requires `createStream`. Default: false.
+   */
+  autoStream?: boolean
 }
 
-export function WorkloadLogsViewer({ name, fetchAll, createStream, overrideDownload, forceDark }: WorkloadLogsViewerProps) {
+export function WorkloadLogsViewer({ name, fetchAll, createStream, overrideDownload, forceDark, autoStream = false }: WorkloadLogsViewerProps) {
   const [selectedContainer, setSelectedContainer] = useState<string>('')
   const [pods, setPods] = useState<WorkloadPodInfo[]>([])
   const [selectedPods, setSelectedPods] = useState<Set<string>>(new Set())
@@ -61,7 +67,12 @@ export function WorkloadLogsViewer({ name, fetchAll, createStream, overrideDownl
 
   const { tailLines, sinceSeconds } = parseLogRange(logRange)
   const { entries, append, set, clear } = useLogBuffer()
-  const { isStreaming, startStreaming, stopStreaming } = useLogStream()
+  const { isStreaming, streamError, connecting, startStreaming, stopStreaming } = useLogStream()
+
+  const willAutoStream = autoStream && !!createStream
+  // null sentinel so the initial selectedContainer ('' = all) still arms once.
+  const autoStartedForRef = useRef<string | null>(null)
+  const userStoppedRef = useRef(false)
 
   // Map pod.name → index. Color classes are resolved at render time from the
   // current palette (see LogCore / pod-filter dropdown below) so toggling
@@ -105,11 +116,30 @@ export function WorkloadLogsViewer({ name, fetchAll, createStream, overrideDownl
     }
   }, [fetchAll, selectedContainer, tailLines, sinceSeconds, set])
 
-  useEffect(() => { loadLogs() }, [loadLogs])
+  // When auto-streaming the stream supplies the initial tail, so the static
+  // snapshot fetch is skipped to avoid a redundant request and a flash of
+  // snapshot content before the stream takes over. If the user has Stopped we
+  // won't auto-start, so fall back to the snapshot — otherwise a container
+  // switch would keep showing the previous selection's lines.
+  useEffect(() => {
+    if (!willAutoStream || userStoppedRef.current) loadLogs()
+  }, [loadLogs, willAutoStream])
   useEffect(() => { stopStreaming() }, [selectedContainer, stopStreaming])
+
+  // If auto-stream turns off while a stream is open, stop following so live
+  // appends don't race the snapshot.
+  const prevWillAutoStreamRef = useRef(willAutoStream)
+  useEffect(() => {
+    if (prevWillAutoStreamRef.current && !willAutoStream && isStreaming) stopStreaming()
+    prevWillAutoStreamRef.current = willAutoStream
+  }, [willAutoStream, isStreaming, stopStreaming])
 
   const handleStartStreaming = useCallback(() => {
     if (!createStream) return
+    // The stream replays the last N lines per pod (TailLines + Follow); clear
+    // first so they don't duplicate lines already in the buffer (the snapshot on
+    // the manual path, or an earlier stream on restart).
+    clear()
     startStreaming(
       () => createStream({ container: selectedContainer || undefined, tailLines: 50, sinceSeconds }),
       {
@@ -156,9 +186,26 @@ export function WorkloadLogsViewer({ name, fetchAll, createStream, overrideDownl
           }
         },
       },
-      'Workload log stream error',
+      'Workload log stream connection failed',
     )
-  }, [createStream, startStreaming, selectedContainer, sinceSeconds, append, podColorIndex, selectedPods.size])
+  }, [createStream, startStreaming, selectedContainer, sinceSeconds, append, podColorIndex, selectedPods.size, clear])
+
+  const handleStopStreaming = useCallback(() => {
+    userStoppedRef.current = true
+    stopStreaming()
+  }, [stopStreaming])
+
+  useEffect(() => {
+    if (!willAutoStream) return
+    if (userStoppedRef.current) return
+    if (autoStartedForRef.current === selectedContainer) return
+    autoStartedForRef.current = selectedContainer
+    handleStartStreaming()
+    // Reset the arm latch on teardown so a re-run re-streams — without this,
+    // React Strict Mode's mount→unmount→mount closes the stream but the latch
+    // stays set, leaving the viewer static.
+    return () => { autoStartedForRef.current = null }
+  }, [willAutoStream, selectedContainer, handleStartStreaming])
 
   const allContainers = useMemo(() => {
     const s = new Set<string>()
@@ -280,24 +327,29 @@ export function WorkloadLogsViewer({ name, fetchAll, createStream, overrideDownl
         lineOptions={[50, 100, 500, 1000]}
         tooltip="How many logs to load per pod — by line count or time range"
         isDark={isDark}
+        disabled={isStreaming}
       />
     </>
   )
 
+  // While the auto-stream is opening (before it first settles), show the
+  // loading state rather than the empty-logs placeholder.
+  const isConnecting = willAutoStream && connecting && entries.length === 0
+
   return (
     <LogCore
       entries={filteredEntries}
-      isLoading={isLoading}
+      isLoading={isLoading || isConnecting}
       isStreaming={isStreaming}
       onStartStream={createStream ? handleStartStreaming : undefined}
-      onStopStream={stopStreaming}
+      onStopStream={handleStopStreaming}
       onRefresh={loadLogs}
       onDownload={downloadLogs}
       onClear={clear}
       toolbarExtra={renderToolbarExtra}
       showPodName
       emptyMessage={pods.length === 0 ? 'No pods found' : 'No logs available'}
-      errorMessage={fetchError}
+      errorMessage={fetchError || (entries.length === 0 ? streamError : null)}
       forceDark={forceDark}
     />
   )
