@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/labels"
@@ -687,7 +688,7 @@ func DetectAdmissionProblems(cache *ResourceCache, namespace string) []Detection
 
 func detectAdmissionFailures(cache *ResourceCache, namespace string) []Detection {
 	if cache.Events() == nil {
-		return nil
+		return detectAdmissionConditionProblems(cache, namespace, map[string]bool{})
 	}
 	var events []*corev1.Event
 	if namespace != "" {
@@ -756,6 +757,11 @@ func detectAdmissionFailures(cache *ResourceCache, namespace string) []Detection
 			DurationSeconds: int64(ageDur.Seconds()),
 		})
 	}
+	seen := make(map[string]bool, len(problems))
+	for _, p := range problems {
+		seen[admissionProblemKey(p.Kind, p.Namespace, p.Name)] = true
+	}
+	problems = append(problems, detectAdmissionConditionProblems(cache, namespace, seen)...)
 	return problems
 }
 
@@ -781,11 +787,12 @@ func eventFirstTime(e *corev1.Event) time.Time {
 // A recovered workload has its replicas, so its lingering event is skipped.
 // Unknown kinds / unreadable listers default to true — never drop genuine coverage.
 func admissionTargetStillBlocked(cache *ResourceCache, obj corev1.ObjectReference) bool {
-	// "Blocked" means the controller still can't CREATE its pods — measured by
-	// created-count (Status.Replicas / CurrentNumberScheduled) below desired,
+	// "Blocked" means the controller still can't CREATE the pods it needs,
 	// NOT readiness. A workload whose pods were created but stay not-ready for
 	// another reason (e.g. unschedulable after a quota was raised) has its pods
-	// and is no longer admission-blocked.
+	// and is no longer admission-blocked. Deployments also need the updated
+	// replica count checked so rolling updates blocked on new-pod creation do
+	// not get masked by old replicas.
 	switch obj.Kind {
 	case "ReplicaSet":
 		if l := cache.ReplicaSets(); l != nil {
@@ -801,7 +808,7 @@ func admissionTargetStillBlocked(cache *ResourceCache, obj corev1.ObjectReferenc
 		if l := cache.Deployments(); l != nil {
 			d, err := l.Deployments(obj.Namespace).Get(obj.Name)
 			if err == nil {
-				return d.Status.Replicas < schedDesiredReplicas(d.Spec.Replicas)
+				return deploymentNeedsPodCreation(d)
 			}
 			if apierrors.IsNotFound(err) {
 				return false
@@ -851,6 +858,143 @@ func schedDesiredReplicas(r *int32) int32 {
 		return 1
 	}
 	return *r
+}
+
+func detectAdmissionConditionProblems(cache *ResourceCache, namespace string, seen map[string]bool) []Detection {
+	var out []Detection
+	now := time.Now()
+	if seen == nil {
+		seen = map[string]bool{}
+	}
+
+	if l := cache.ReplicaSets(); l != nil {
+		var items []*appsv1.ReplicaSet
+		if namespace != "" {
+			items, _ = l.ReplicaSets(namespace).List(labels.Everything())
+		} else {
+			items, _ = l.List(labels.Everything())
+		}
+		for _, rs := range items {
+			key := admissionProblemKey("ReplicaSet", rs.Namespace, rs.Name)
+			if seen[key] || hasSeenDeploymentForReplicaSet(seen, rs) || rs.Status.Replicas >= schedDesiredReplicas(rs.Spec.Replicas) {
+				continue
+			}
+			for _, c := range rs.Status.Conditions {
+				if c.Type != appsv1.ReplicaSetReplicaFailure || c.Status != corev1.ConditionTrue {
+					continue
+				}
+				if p, ok := admissionConditionProblem("ReplicaSet", rs.Namespace, rs.Name, c.Message, c.LastTransitionTime.Time, now); ok {
+					out = append(out, p)
+					seen[key] = true
+					break
+				}
+			}
+		}
+	}
+
+	if l := cache.Deployments(); l != nil {
+		var items []*appsv1.Deployment
+		if namespace != "" {
+			items, _ = l.Deployments(namespace).List(labels.Everything())
+		} else {
+			items, _ = l.List(labels.Everything())
+		}
+		for _, d := range items {
+			if !deploymentNeedsPodCreation(d) {
+				continue
+			}
+			if hasSeenReplicaSetForDeployment(cache, seen, d.Namespace, d.Name) {
+				continue
+			}
+			for _, c := range d.Status.Conditions {
+				if c.Type != appsv1.DeploymentReplicaFailure || c.Status != corev1.ConditionTrue {
+					continue
+				}
+				if p, ok := admissionConditionProblem("Deployment", d.Namespace, d.Name, c.Message, c.LastTransitionTime.Time, now); ok {
+					key := admissionProblemKey(p.Kind, p.Namespace, p.Name)
+					if !seen[key] {
+						out = append(out, p)
+						seen[key] = true
+					}
+				}
+			}
+		}
+	}
+
+	return out
+}
+
+func deploymentNeedsPodCreation(d *appsv1.Deployment) bool {
+	desired := schedDesiredReplicas(d.Spec.Replicas)
+	return desired > 0 && (d.Status.Replicas < desired || d.Status.UpdatedReplicas < desired)
+}
+
+func admissionConditionProblem(kind, namespace, name, message string, firstSeen, now time.Time) (Detection, bool) {
+	reason, ok := classifyAdmissionFailure(message)
+	if !ok {
+		return Detection{}, false
+	}
+	if firstSeen.IsZero() {
+		firstSeen = now
+	}
+	ageDur := now.Sub(firstSeen)
+	return Detection{
+		Kind:            kind,
+		Namespace:       namespace,
+		Name:            name,
+		Severity:        "critical",
+		Reason:          reason,
+		Message:         "pod creation blocked: " + strings.TrimSpace(message),
+		Age:             FormatAge(ageDur),
+		AgeSeconds:      int64(ageDur.Seconds()),
+		Duration:        FormatAge(ageDur),
+		DurationSeconds: int64(ageDur.Seconds()),
+	}, true
+}
+
+func admissionProblemKey(kind, namespace, name string) string {
+	return kind + "/" + namespace + "/" + name
+}
+
+func hasSeenReplicaSetForDeployment(cache *ResourceCache, seen map[string]bool, namespace, deployment string) bool {
+	if cache == nil || deployment == "" {
+		return false
+	}
+	l := cache.ReplicaSets()
+	if l == nil {
+		return false
+	}
+	items, _ := l.ReplicaSets(namespace).List(labels.Everything())
+	for _, rs := range items {
+		if seen[admissionProblemKey("ReplicaSet", rs.Namespace, rs.Name)] && replicaSetOwnedByDeployment(rs, deployment) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasSeenDeploymentForReplicaSet(seen map[string]bool, rs *appsv1.ReplicaSet) bool {
+	deployment, ok := replicaSetDeploymentOwnerName(rs)
+	if !ok {
+		return false
+	}
+	return seen[admissionProblemKey("Deployment", rs.Namespace, deployment)]
+}
+
+func replicaSetOwnedByDeployment(rs *appsv1.ReplicaSet, deployment string) bool {
+	name, ok := replicaSetDeploymentOwnerName(rs)
+	return ok && name == deployment
+}
+
+func replicaSetDeploymentOwnerName(rs *appsv1.ReplicaSet) (string, bool) {
+	if rs == nil {
+		return "", false
+	}
+	owner := controllerOwnerRef(rs.OwnerReferences)
+	if owner == nil || owner.Kind != "Deployment" || owner.Name == "" {
+		return "", false
+	}
+	return owner.Name, true
 }
 
 // classifyAdmissionFailure maps a FailedCreate event message to a reason.
