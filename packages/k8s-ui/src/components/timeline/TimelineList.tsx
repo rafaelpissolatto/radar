@@ -53,6 +53,11 @@ export interface TimelineListProps {
   onResourceClick?: NavigateToResource
   initialFilter?: ActivityTypeFilter
   initialTimeRange?: TimeRange
+  // Controlled "show deleted" toggle. When omitted the component manages it
+  // internally; the host passes it to share one toggle across list + swimlane
+  // and to drive server-side delete filtering.
+  showDeleted?: boolean
+  onShowDeletedChange?: (showDeleted: boolean) => void
 }
 
 const TIME_RANGES: { value: TimeRange; label: string }[] = [
@@ -80,11 +85,14 @@ const RESOURCE_KINDS = [
   'StatefulSet',
 ]
 
-export function TimelineList({ events, isLoading, onRefresh, onQueryChange, hasLimitedAccess, namespaces, onViewChange, currentView = 'list', onResourceClick, initialFilter, initialTimeRange }: TimelineListProps) {
+export function TimelineList({ events, isLoading, onRefresh, onQueryChange, hasLimitedAccess, namespaces, onViewChange, currentView = 'list', onResourceClick, initialFilter, initialTimeRange, showDeleted: showDeletedProp, onShowDeletedChange }: TimelineListProps) {
   const [searchTerm, setSearchTerm] = useState('')
   const [activityTypeFilter, setActivityTypeFilter] = useState<ActivityTypeFilter>(initialFilter ?? 'all')
   const [timeRange, setTimeRange] = useState<TimeRange>(initialTimeRange ?? '1h')
   const [kindFilter, setKindFilter] = useState<string>('')
+  const [showDeletedInternal, setShowDeletedInternal] = useState(true)
+  const showDeleted = showDeletedProp ?? showDeletedInternal
+  const setShowDeleted = onShowDeletedChange ?? setShowDeletedInternal
   const [expandedItem, setExpandedItem] = useState<string | null>(null)
 
   useEffect(() => {
@@ -111,6 +119,7 @@ export function TimelineList({ events, isLoading, onRefresh, onQueryChange, hasL
         const isUnhealthyChange = isChangeEvent(item) && (item.healthState === 'unhealthy' || item.healthState === 'degraded')
         if (!isUnhealthyChange) return false
       }
+      if (!showDeleted && item.eventType === 'delete') return false
 
       // Filter by search term
       if (searchTerm) {
@@ -129,7 +138,7 @@ export function TimelineList({ events, isLoading, onRefresh, onQueryChange, hasL
 
       return true
     })
-  }, [events, activityTypeFilter, searchTerm])
+  }, [events, activityTypeFilter, searchTerm, showDeleted])
 
   // Aggregated event group type
   type AggregatedItem = {
@@ -245,12 +254,13 @@ export function TimelineList({ events, isLoading, onRefresh, onQueryChange, hasL
 
   // Count stats
   const stats = useMemo(() => {
-    if (!events) return { total: 0, changes: 0, warnings: 0, unhealthy: 0 }
+    if (!events) return { total: 0, changes: 0, warnings: 0, unhealthy: 0, deleted: 0 }
     return {
       total: events.length,
       changes: events.filter((e) => isChangeEvent(e)).length,
       warnings: events.filter((e) => e.eventType === 'Warning').length,
       unhealthy: events.filter((e) => isChangeEvent(e) && (e.healthState === 'unhealthy' || e.healthState === 'degraded')).length,
+      deleted: events.filter((e) => e.eventType === 'delete').length,
     }
   }, [events])
 
@@ -305,6 +315,24 @@ export function TimelineList({ events, isLoading, onRefresh, onQueryChange, hasL
             tooltip="All native Kubernetes events (Normal + Warning types)"
           />
         </div>
+
+        <button
+          type="button"
+          onClick={() => setShowDeleted(!showDeleted)}
+          title="Show or hide resources that were deleted, including Pods that no longer exist"
+          className={clsx(
+            'px-3 py-1.5 text-sm rounded-md transition-colors flex items-center gap-2 bg-theme-elevated',
+            showDeleted ? 'text-theme-text-primary' : 'text-theme-text-secondary hover:text-theme-text-primary'
+          )}
+        >
+          <Trash2 className="w-3 h-3" />
+          Deleted
+          {stats.deleted > 0 && (
+            <span className="text-xs px-1.5 rounded bg-theme-hover/50">
+              {stats.deleted}
+            </span>
+          )}
+        </button>
 
         {/* Kind filter */}
         <select

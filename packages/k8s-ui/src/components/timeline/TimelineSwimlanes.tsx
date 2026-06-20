@@ -21,6 +21,7 @@ import {
   Timer,
   RotateCcw,
   Shield,
+  Trash2,
 } from 'lucide-react'
 import type { TimelineEvent, Topology } from '../../types'
 import type { NavigateToResource } from '../../utils/navigation'
@@ -57,6 +58,11 @@ export interface TimelineSwimlanesProps {
   // navigate (radar router push, or cross-route-tree href). When omitted, GitOps lanes
   // fall back to onResourceClick (the resource drawer).
   onNavigatePath?: (path: string) => void
+  // Controlled "show deleted" toggle. When omitted the component manages it
+  // internally; the host passes it to share one toggle with the list view and
+  // to drive server-side delete filtering on the underlying fetch.
+  showDeleted?: boolean
+  onShowDeletedChange?: (showDeleted: boolean) => void
 }
 
 interface ResourceLane extends BaseResourceLane {
@@ -180,7 +186,7 @@ function calculateInterestingnessWithBreakdown(lane: ResourceLane): ScoreBreakdo
   return breakdown
 }
 
-export function TimelineSwimlanes({ events, isLoading, onResourceClick, viewMode, onViewModeChange, topology, namespaces, hasLimitedAccess = false, onNavigatePath }: TimelineSwimlanesProps) {
+export function TimelineSwimlanes({ events, isLoading, onResourceClick, viewMode, onViewModeChange, topology, namespaces, hasLimitedAccess = false, onNavigatePath, showDeleted: showDeletedProp, onShowDeletedChange }: TimelineSwimlanesProps) {
   // Timeline lane labels for GitOps CRs (Application/Kustomization/HelmRelease)
   // deep-link to GitOps detail rather than the resource drawer — the lane is
   // already telling the user "this controller had changes/events"; the GitOps
@@ -203,6 +209,9 @@ export function TimelineSwimlanes({ events, isLoading, onResourceClick, viewMode
   const [expandedLanes, setExpandedLanes] = useState<Set<string>>(new Set())
   const [hasAutoZoomed, setHasAutoZoomed] = useState(false)
   const [groupByApp, setGroupByApp] = useState(true) // Group by app.kubernetes.io/name label
+  const [showDeletedInternal, setShowDeletedInternal] = useState(true)
+  const showDeleted = showDeletedProp ?? showDeletedInternal
+  const setShowDeleted = onShowDeletedChange ?? setShowDeletedInternal
 
   // Stable lane ordering - use ref to avoid render loop (lanes depends on order, order depends on lanes)
   const laneOrderRef = useRef<Map<string, number>>(new Map())
@@ -253,17 +262,18 @@ export function TimelineSwimlanes({ events, isLoading, onResourceClick, viewMode
 
   // Filter events by search term
   const filteredEvents = useMemo(() => {
-    if (!searchTerm) return events
+    const baseEvents = showDeleted ? events : events.filter(e => e.eventType !== 'delete')
+    if (!searchTerm) return baseEvents
 
     const term = searchTerm.toLowerCase()
-    return events.filter(e =>
+    return baseEvents.filter(e =>
       e.name.toLowerCase().includes(term) ||
       e.kind.toLowerCase().includes(term) ||
       e.namespace?.toLowerCase().includes(term) ||
       e.reason?.toLowerCase().includes(term) ||
       e.message?.toLowerCase().includes(term)
     )
-  }, [events, searchTerm])
+  }, [events, searchTerm, showDeleted])
 
   // Build hierarchical lanes using owner references + topology edges
   // Uses the shared utility from utils/resource-hierarchy.ts
@@ -512,6 +522,18 @@ export function TimelineSwimlanes({ events, isLoading, onResourceClick, viewMode
                   className="w-3.5 h-3.5 rounded border-theme-border-light bg-theme-elevated text-accent focus:ring-accent focus:ring-offset-0"
                 />
                 <span className="border-b border-dotted border-theme-text-tertiary">Group by app</span>
+              </label>
+            </Tooltip>
+            <Tooltip content="Show resources Radar observed being deleted, including Pods that no longer exist" position="bottom">
+              <label className="flex items-center gap-1.5 text-xs text-theme-text-secondary hover:text-theme-text-primary">
+                <input
+                  type="checkbox"
+                  checked={showDeleted}
+                  onChange={(e) => setShowDeleted(e.target.checked)}
+                  className="w-3.5 h-3.5 rounded border-theme-border-light bg-theme-elevated text-accent focus:ring-accent focus:ring-offset-0"
+                />
+                <Trash2 className="w-3.5 h-3.5" />
+                <span className="border-b border-dotted border-theme-text-tertiary">Deleted</span>
               </label>
             </Tooltip>
             {/* View toggle */}
