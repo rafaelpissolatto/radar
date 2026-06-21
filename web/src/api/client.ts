@@ -1136,6 +1136,7 @@ export function useResourceEvents(kind: string, namespace: string, name: string)
     const p = new URLSearchParams()
     p.set('namespace', namespace)
     p.set('kind', singularKind)
+    p.set('name', name)
     p.set('include_managed', 'true')
     p.set('since', since)
     return p
@@ -1152,8 +1153,7 @@ export function useResourceEvents(kind: string, namespace: string, name: string)
       const params = baseParams()
       params.set('sources', 'k8s_event')
       params.set('limit', '500')
-      const events = await fetchJSON<TimelineEvent[]>(`/changes?${params.toString()}`)
-      return events.filter(e => e.name === name)
+      return fetchJSON<TimelineEvent[]>(`/changes?${params.toString()}`)
     },
     enabled,
     refetchInterval: 15000,
@@ -1167,8 +1167,7 @@ export function useResourceEvents(kind: string, namespace: string, name: string)
       const params = baseParams()
       params.set('sources', 'informer,historical')
       params.set('limit', '50')
-      const events = await fetchJSON<TimelineEvent[]>(`/changes?${params.toString()}`)
-      return events.filter(e => e.name === name)
+      return fetchJSON<TimelineEvent[]>(`/changes?${params.toString()}`)
     },
     enabled,
     refetchInterval: 15000,

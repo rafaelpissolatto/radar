@@ -2370,6 +2370,7 @@ func (s *Server) handleChanges(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	kind := r.URL.Query().Get("kind")
+	name := r.URL.Query().Get("name")
 	sinceStr := r.URL.Query().Get("since")
 	limitStr := r.URL.Query().Get("limit")
 	filterPreset := r.URL.Query().Get("filter")
@@ -2420,6 +2421,9 @@ func (s *Server) handleChanges(w http.ResponseWriter, r *http.Request) {
 	}
 	if kind != "" {
 		opts.Kinds = []string{kind}
+	}
+	if name != "" {
+		opts.Names = []string{name}
 	}
 	if sourcesParam != "" {
 		validSources := map[timeline.EventSource]bool{

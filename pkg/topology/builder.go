@@ -326,6 +326,7 @@ func (b *Builder) buildResourcesTopology(opts BuildOptions) (*Topology, error) {
 
 	var rolloutGVR schema.GroupVersionResource
 	hasRollouts := false
+	rolloutsByNamespace := make(map[string][]*unstructured.Unstructured)
 	if resourceDiscovery != nil {
 		rolloutGVR, hasRollouts = resourceDiscovery.GetGVR("Rollout")
 	}
@@ -340,6 +341,7 @@ func (b *Builder) buildResourcesTopology(opts BuildOptions) (*Topology, error) {
 			if !opts.MatchesNamespaceFilter(ns) {
 				continue
 			}
+			rolloutsByNamespace[ns] = append(rolloutsByNamespace[ns], rollout)
 			name := rollout.GetName()
 
 			rolloutID := fmt.Sprintf("rollout/%s/%s", ns, name)
@@ -2848,13 +2850,8 @@ func (b *Builder) buildResourcesTopology(opts BuildOptions) (*Topology, error) {
 			}
 		}
 		// Check Rollouts (if we have any)
-		if hasRollouts && dynamicCache != nil {
-			svcRollouts, rolloutErr := dynamicCache.List(rolloutGVR, svc.Namespace)
-			if rolloutErr != nil {
-				log.Printf("WARNING [topology] Failed to list Rollouts for service %s/%s: %v", svc.Namespace, svc.Name, rolloutErr)
-				warnings = append(warnings, fmt.Sprintf("Failed to list Rollouts: %v", rolloutErr))
-			}
-			for _, rollout := range svcRollouts {
+		if hasRollouts {
+			for _, rollout := range rolloutsByNamespace[svc.Namespace] {
 				spec, _, _ := unstructured.NestedMap(rollout.Object, "spec", "template", "metadata")
 				if spec != nil {
 					if podLabels, ok := spec["labels"].(map[string]any); ok {

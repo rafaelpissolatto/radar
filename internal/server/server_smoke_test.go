@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
@@ -788,6 +790,46 @@ func TestSmokeChanges(t *testing.T) {
 func TestSmokeChangesWithFilters(t *testing.T) {
 	var body []any
 	assertOK(t, get(t, "/api/changes?namespace=default&kind=Deployment&limit=10"), &body)
+}
+
+func TestSmokeChangesNameFilter(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now()
+	clusterContext := k8s.ActiveClusterContext()
+	events := []timeline.TimelineEvent{
+		{
+			ID:             "smoke-name-filter-keep",
+			Timestamp:      now,
+			Source:         timeline.SourceInformer,
+			Kind:           "Deployment",
+			Namespace:      "default",
+			Name:           "smoke-name-filter-keep",
+			EventType:      timeline.EventTypeUpdate,
+			ClusterContext: clusterContext,
+		},
+		{
+			ID:             "smoke-name-filter-drop",
+			Timestamp:      now,
+			Source:         timeline.SourceInformer,
+			Kind:           "Deployment",
+			Namespace:      "default",
+			Name:           "smoke-name-filter-drop",
+			EventType:      timeline.EventTypeUpdate,
+			ClusterContext: clusterContext,
+		},
+	}
+	if err := timeline.RecordEvents(ctx, events); err != nil {
+		t.Fatalf("RecordEvents: %v", err)
+	}
+
+	var body []timeline.TimelineEvent
+	assertOK(t, get(t, "/api/changes?namespace=default&kind=Deployment&name=smoke-name-filter-keep&include_managed=true&filter=all&limit=10"), &body)
+	if len(body) != 1 {
+		t.Fatalf("expected exactly one name-filtered event, got %d: %+v", len(body), body)
+	}
+	if body[0].Name != "smoke-name-filter-keep" {
+		t.Fatalf("expected smoke-name-filter-keep, got %q", body[0].Name)
+	}
 }
 
 func TestSmokeChangeChildren(t *testing.T) {
