@@ -1,7 +1,9 @@
 import { useState, useMemo, useCallback, useEffect } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
-import { ApiError, debugNamespaceLog, fetchJSON, isForbiddenError, useCapabilities, useNamespaceCapabilities, useSecretCertExpiry, useTopPodMetrics, useTopNodeMetrics, useBulkDeleteResources, useBulkRestartWorkloads, useBulkScaleWorkloads } from '../../api/client'
+import { ApiError, debugNamespaceLog, fetchJSON, isForbiddenError, useCapabilities, useNamespaceCapabilities, useSecretCertExpiry, useTopPodMetrics, useTopNodeMetrics, useBulkDeleteResources, useBulkRestartWorkloads, useBulkScaleWorkloads, useAudit } from '../../api/client'
+import { isBadgeWorthy } from '../../utils/auditBadges'
+import type { AuditBadgeMessage } from '@skyhook-io/k8s-ui'
 import { apiUrl, getAuthHeaders, getCredentialsMode, getBasename } from '../../api/config'
 import { useAPIResources } from '../../api/apiResources'
 import { initNavigationMap } from '@skyhook-io/k8s-ui'
@@ -136,6 +138,44 @@ export function ResourcesView({ namespaces, selectedResource, onResourceClick, o
       ?? CORE_RESOURCES.find(r => r.name === selectedKind.name && r.group === selectedKind.group)
     return match?.isCrd ?? (!!selectedKind.group) // default: has group = likely CRD
   }, [selectedKind, apiResources])
+
+  // The canonical Kind for the selected resource. selectedKind.kind is the plural
+  // URL segment for CRDs/grouped kinds (e.g. "ingressroutes", "ingresses") — only
+  // core no-group kinds resolve to the real Kind there — so resolve it via
+  // discovery to match audit findings, which key by the real Kind ("IngressRoute").
+  const selectedKindCanonical = useMemo(() => {
+    if (!selectedKind) return undefined
+    const match = apiResources?.find(r => r.name === selectedKind.name && r.group === selectedKind.group)
+      ?? CORE_RESOURCES.find(r => r.name === selectedKind.name && r.group === selectedKind.group)
+    return match?.kind ?? selectedKind.kind
+  }, [selectedKind, apiResources])
+
+  // Cluster Audit findings for the selected kind, keyed by "namespace/name" for
+  // the resource list. The list shows ONE kind at a time, so ns/name is enough;
+  // we still match the finding's group (built-ins → real group, CRDs → "") so a
+  // kind shared across groups doesn't bleed findings across the two lists. Only
+  // "badge-worthy" findings count (reference-integrity / lifecycle) — posture
+  // and best-practice nags fire near-universally and would just be noise.
+  const audit = useAudit(namespaces)
+  const auditBadges = useMemo(() => {
+    if (!selectedKind || !audit.data?.findings) return undefined
+    const wantGroup = isSelectedCrd ? '' : selectedKind.group
+    const map: Record<string, { danger: number; warning: number; messages: AuditBadgeMessage[] }> = {}
+    for (const f of audit.data.findings) {
+      if (f.kind !== selectedKindCanonical || (f.group ?? '') !== wantGroup) continue
+      if (!isBadgeWorthy(f, audit.data.checks)) continue
+      const k = `${f.namespace || ''}/${f.name}`
+      const cur = map[k] ?? { danger: 0, warning: 0, messages: [] }
+      if (f.severity === 'danger') cur.danger++
+      else if (f.severity === 'warning') cur.warning++
+      cur.messages.push({ severity: f.severity, message: f.message })
+      map[k] = cur
+    }
+    for (const cur of Object.values(map)) {
+      cur.messages.sort((a, b) => (a.severity === 'danger' ? 0 : 1) - (b.severity === 'danger' ? 0 : 1))
+    }
+    return map
+  }, [audit.data?.findings, audit.data?.checks, selectedKind, selectedKindCanonical, isSelectedCrd])
 
   const selectedCountKey = selectedKind ? resourceCountKey(selectedKind) : ''
   const selectedCount = selectedCountKey ? countsData?.counts[selectedCountKey] : undefined
@@ -294,6 +334,7 @@ export function ResourcesView({ namespaces, selectedResource, onResourceClick, o
       topNodeMetrics={topNodeMetrics}
       certExpiry={certExpiry}
       certExpiryError={certExpiryError}
+      auditBadges={auditBadges}
       // Pinned kinds
       pinned={pinned}
       togglePin={togglePin}

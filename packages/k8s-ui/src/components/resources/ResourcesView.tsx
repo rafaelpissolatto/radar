@@ -129,11 +129,12 @@ import {
   podMatchesProblemCategory,
   SEVERITY_DOT_COLOR,
 } from './resource-utils'
-import { SEVERITY_BADGE, EVENT_TYPE_COLORS } from '../../utils/badge-colors'
+import { SEVERITY_BADGE, EVENT_TYPE_COLORS, SEVERITY_TEXT } from '../../utils/badge-colors'
 import { pluralize } from '../../utils/pluralize'
 import { getPodGpuCount, getNodeGpuCount } from '../../utils/extended-resources'
 import { type CustomColumnDef, type CustomColumnSource, customColumnKey, readCustomColumnValue, sanitizeCustomColumnDefs } from '../../utils/custom-columns'
 import { Tooltip } from '../ui/Tooltip'
+import { AuditBadgeTooltip, type AuditBadgeMessage } from '../audit/AuditBadgeTooltip'
 // CRD-specific cell components (extracted)
 import { GitRepositoryCell, OCIRepositoryCell, HelmRepositoryCell, KustomizationCell, FluxHelmReleaseCell, FluxAlertCell } from './renderers/flux-cells'
 import { ArgoApplicationCell, ArgoApplicationSetCell, ArgoAppProjectCell } from './renderers/argo-cells'
@@ -1800,6 +1801,9 @@ interface ResourcesViewData {
   onNavigate?: (path: string, options?: { replace?: boolean }) => void
   certExpiry?: Record<string, { expired?: boolean; daysLeft: number }>
   certExpiryError?: boolean
+  // Cluster Audit findings for the listed kind, keyed by "namespace/name" (the
+  // list shows one kind at a time, so ns/name is unambiguous). Host-injected.
+  auditBadges?: Record<string, { danger: number; warning: number; messages?: AuditBadgeMessage[] }>
   onOpenLogs?: (params: { namespace: string; podName: string; containers: string[]; containerName?: string }) => void
   onOpenWorkloadLogs?: (params: { namespace: string; workloadKind: string; workloadName: string }) => void
 }
@@ -1852,6 +1856,8 @@ interface ResourcesViewProps {
   topNodeMetrics?: TopNodeMetrics[]
   certExpiry?: Record<string, { expired?: boolean; daysLeft: number }>
   certExpiryError?: boolean
+  // Cluster Audit findings for the selected kind, keyed by "namespace/name".
+  auditBadges?: Record<string, { danger: number; warning: number; messages?: AuditBadgeMessage[] }>
   // Pinned kinds
   pinned?: Array<{ name: string; kind: string; group: string }>
   togglePin?: (kind: { name: string; kind: string; group: string }) => void
@@ -2070,6 +2076,7 @@ export function ResourcesView({
   topNodeMetrics,
   certExpiry,
   certExpiryError,
+  auditBadges,
   pinned = [],
   togglePin = () => {},
   isPinned = () => false,
@@ -4014,9 +4021,10 @@ export function ResourcesView({
     onNavigate,
     certExpiry,
     certExpiryError,
+    auditBadges,
     onOpenLogs,
     onOpenWorkloadLogs,
-  }), [onNavigate, certExpiry, certExpiryError, onOpenLogs, onOpenWorkloadLogs])
+  }), [onNavigate, certExpiry, certExpiryError, auditBadges, onOpenLogs, onOpenWorkloadLogs])
 
   return (
     <ResourcesViewDataContext.Provider value={resourcesViewDataContextValue}>
@@ -5155,6 +5163,7 @@ interface CellContentProps {
 }
 
 function CellContent({ resource, kind, column, group, majorityNodeMinorVersion, extraColumn, nameHref }: CellContentProps) {
+  const { auditBadges } = useContext(ResourcesViewDataContext)
   // Parent-injected extra columns short-circuit the built-in switch.
   // Used by hosts that inject leading columns (e.g. a multi-cluster Cluster column).
   if (extraColumn) {
@@ -5167,6 +5176,8 @@ function CellContent({ resource, kind, column, group, majorityNodeMinorVersion, 
   if (column === 'name') {
     const isTerminating = !!meta.deletionTimestamp
     const nameClass = clsx('text-sm font-medium truncate block', isTerminating ? 'text-theme-text-tertiary line-through' : 'text-theme-text-primary')
+    const audit = auditBadges?.[`${meta.namespace || ''}/${meta.name}`]
+    const auditTotal = audit ? audit.danger + audit.warning : 0
     return (
       <div className="flex items-center gap-1.5 min-w-0">
         <Tooltip content={meta.name}>
@@ -5184,6 +5195,16 @@ function CellContent({ resource, kind, column, group, majorityNodeMinorVersion, 
           )}
         </Tooltip>
         <CopyNameButton name={meta.name} />
+        {auditTotal > 0 && audit && (
+          <Tooltip content={audit.messages && audit.messages.length > 0
+            ? <AuditBadgeTooltip messages={audit.messages} />
+            : `${auditTotal} audit ${auditTotal === 1 ? 'finding' : 'findings'}${audit.danger > 0 ? ` · ${audit.danger} danger` : ''}`}>
+            <span className={clsx('shrink-0 inline-flex items-center gap-0.5 text-[10px] font-medium cursor-help', audit.danger > 0 ? SEVERITY_TEXT.error : SEVERITY_TEXT.warning)}>
+              <AlertTriangle className="w-3 h-3" />
+              {auditTotal}
+            </span>
+          </Tooltip>
+        )}
         {isTerminating && (
           <Tooltip content="Resource is being deleted (has deletionTimestamp set). May be stuck due to finalizers.">
             <span className="shrink-0 flex items-center gap-1 px-1.5 py-0.5 text-[10px] font-medium bg-red-500/15 text-red-600 dark:text-red-400 rounded">
@@ -6022,6 +6043,7 @@ function ReplicaSetCell({ resource, column }: { resource: any; column: string })
 }
 
 function ServiceCell({ resource, column }: { resource: any; column: string }) {
+  const { auditBadges } = useContext(ResourcesViewDataContext)
   switch (column) {
     case 'type': {
       const status = getServiceStatus(resource)
@@ -6042,6 +6064,20 @@ function ServiceCell({ resource, column }: { resource: any; column: string }) {
       )
     }
     case 'endpoints': {
+      // getServiceEndpointsStatus can't see live pods, so it optimistically
+      // reports "Active" for any service with a selector. The audit's
+      // serviceNoMatchingPods check DOES resolve the selector against live pods —
+      // the only badge-worthy finding a Service can carry — so when it fired,
+      // trust it over the guess instead of showing a false-green "Active".
+      const meta = resource.metadata || {}
+      const flagged = auditBadges?.[`${meta.namespace || ''}/${meta.name}`]
+      if (flagged && flagged.danger + flagged.warning > 0) {
+        return (
+          <span className={clsx('badge', flagged.danger > 0 ? 'status-unhealthy' : 'status-degraded')}>
+            No endpoints
+          </span>
+        )
+      }
       const { status, color } = getServiceEndpointsStatus(resource)
       return (
         <span className={clsx('badge', color)}>

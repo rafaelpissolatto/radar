@@ -3,15 +3,17 @@ import { Handle, Position } from '@xyflow/react'
 import {
   ChevronDown,
   ChevronUp,
+  TriangleAlert,
 } from 'lucide-react'
 import { clsx } from 'clsx'
 import type { NodeKind, HealthStatus, PodSummary } from '../../types'
 import { displayKind } from '../../types'
-import { healthToSeverity, SEVERITY_DOT } from '../../utils/badge-colors'
+import { healthToSeverity, SEVERITY_DOT, SEVERITY_TEXT } from '../../utils/badge-colors'
 import { workloadHue } from '../../utils/workload-colors'
 import { ownershipOf } from '../../utils/topology-neighborhood'
 import { midTruncate } from '../../utils/format'
 import { Tooltip } from '../ui/Tooltip'
+import { AuditBadgeTooltip, type AuditBadgeMessage } from '../audit/AuditBadgeTooltip'
 
 // Get actionable tooltip content for health issues
 function getIssueTooltip(issue: string | undefined): React.ReactNode {
@@ -382,6 +384,15 @@ export const K8sResourceNode = memo(function K8sResourceNode({
   id,
 }: K8sResourceNodeProps) {
   const { kind, name, status, nodeData, selected, dimmed, onExpand, onCollapse, isExpanded } = data
+  // Cluster Audit findings joined onto this node by the host (web/ enriches each
+  // node's data by auditKey). The host only counts "badge-worthy" findings —
+  // reference-integrity / lifecycle, "this resource is actually broken" — not the
+  // posture/best-practice nags that fire near-universally, so the indicator stays
+  // a signal. Colored by worst severity (danger red, else warning amber).
+  const auditDanger = typeof nodeData.auditDanger === 'number' ? nodeData.auditDanger : 0
+  const auditWarning = typeof nodeData.auditWarning === 'number' ? nodeData.auditWarning : 0
+  const auditTotal = auditDanger + auditWarning
+  const auditMessages = Array.isArray(nodeData.auditMessages) ? (nodeData.auditMessages as AuditBadgeMessage[]) : []
   // Workload tint (application graph): a node owned by exactly one workload
   // carries that workload's hue. Only on healthy/unknown cards — degraded/
   // unhealthy already own the card background for health, which must win.
@@ -511,6 +522,16 @@ export const K8sResourceNode = memo(function K8sResourceNode({
                 >
                   <ChevronUp className="w-3.5 h-3.5 text-theme-text-secondary" />
                 </button>
+              )}
+              {auditTotal > 0 && (
+                <Tooltip
+                  content={auditMessages.length > 0
+                    ? <AuditBadgeTooltip messages={auditMessages} clickHint={false} />
+                    : `${auditTotal} audit ${auditTotal === 1 ? 'finding' : 'findings'}${auditDanger > 0 ? ` · ${auditDanger} danger` : ''}`}
+                  position="right"
+                >
+                  <TriangleAlert className={clsx('w-3 h-3 cursor-help', auditDanger > 0 ? SEVERITY_TEXT.error : SEVERITY_TEXT.warning)} />
+                </Tooltip>
               )}
               {issueTooltip ? (
                 <Tooltip content={issueTooltip} position="right">
