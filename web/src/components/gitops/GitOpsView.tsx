@@ -446,15 +446,6 @@ function GitOpsDetailView({ namespaces, onOpenResource }: GitOpsViewProps) {
   const isFlux = tool === 'flux'
   const isArgoApp = kind === 'applications'
 
-  // Set the browser tab title so users with multiple resource tabs open can
-  // tell which is which without focusing each tab. Restore on unmount so a
-  // stray "Radar — argocd/foo" doesn't outlive its page.
-  useEffect(() => {
-    const previous = document.title
-    document.title = `${name} — Radar`
-    return () => { document.title = previous }
-  }, [name])
-
   // Detail-page shortcuts. Skip when a modal is already open so a stray "s"
   // in an input field doesn't pop another sync dialog.
   const shortcutsEnabled = !syncDialogOpen && !rollbackTarget
@@ -645,7 +636,7 @@ function GitOpsDetailView({ namespaces, onOpenResource }: GitOpsViewProps) {
           search: params.toString(),
         })
       } : undefined}
-      manageDocumentTitle={false /* OSS handles it via the in-effect-above */}
+      manageDocumentTitle={false /* title handled centrally in App's radarPageTitle */}
       renderTabBarCounts={({ tab }) => (
         tab === 'topology' && tree ? <TopologyCounts tree={tree} /> : null
       )}

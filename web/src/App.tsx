@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { flushSync } from 'react-dom'
 import { useRefreshAnimation } from './hooks/useRefreshAnimation'
 import { startViewTransitionSafe } from '@skyhook-io/k8s-ui/utils/view-transition'
+import { englishPlural } from '@skyhook-io/k8s-ui/utils/pluralize'
 import { useQueryClient } from '@tanstack/react-query'
 import { useNavigate, useLocation, useSearchParams, useNavigationType, NavigationType } from 'react-router-dom'
 import { HomeView } from './components/home/HomeView'
@@ -49,6 +50,7 @@ import { buildAuditSeverityMap } from './utils/auditBadges'
 import { routePath, apiUrl, getAuthHeaders, getCredentialsMode } from './api/config'
 import { KeyboardShortcutProvider, useRegisterShortcut, useRegisterShortcuts } from './hooks/useKeyboardShortcuts'
 import { useAnimatedUnmount } from './hooks/useAnimatedUnmount'
+import { useDocumentTitle } from './hooks/useDocumentTitle'
 import radarLoadingIcon from '@skyhook-io/k8s-ui/assets/radar/radar-icon-loading.svg'
 import { RefreshCw, Network, List, Clock, Package, Sun, Moon, Activity, Home, Star, Search, Bug, SquareTerminal, ShieldCheck, GitBranch, HelpCircle } from 'lucide-react'
 import { useTheme } from './context/ThemeContext'
@@ -57,7 +59,7 @@ import { LargeClusterNamespacePicker } from './components/shared/LargeClusterNam
 import { SettingsDialog } from './components/settings/SettingsDialog'
 import { MyPermissionsDialog } from './components/settings/MyPermissionsDialog'
 import type { TopologyNode, GroupingMode, MainView, SelectedResource, SelectedHelmRelease, NodeKind, TopologyMode, Topology, K8sEvent } from './types'
-import { kindToPlural, openExternal, apiVersionToGroup, buildWorkloadPath, searchHitToSelectedResource } from './utils/navigation'
+import { kindToPlural, pluralToKind, openExternal, apiVersionToGroup, buildWorkloadPath, searchHitToSelectedResource } from './utils/navigation'
 import { type OmnibarHandle } from './components/ui/Omnibar'
 import { RadarOmnibar } from './components/ui/RadarOmnibar'
 import type { ContextSwitcherHandle } from './components/ContextSwitcher'
@@ -124,6 +126,54 @@ function getViewFromPath(pathname: string): ExtendedMainView {
   return 'home'
 }
 
+// Browser tab label for every Radar view, derived from the route URL so it's
+// correct regardless of which component renders it. A detail drawer that opens
+// over a list (?resource=…) is deliberately NOT titled — it's the same page, so
+// it keeps the list's title.
+function radarPageTitle(pathname: string, search = '', apiResources?: { name: string; kind: string; group?: string }[]): string | null {
+  const decode = (s: string) => {
+    try {
+      return decodeURIComponent(s)
+    } catch {
+      return s
+    }
+  }
+  const capitalize = (text: string) =>
+    text ? text.charAt(0).toUpperCase() + text.slice(1) : text
+  const pluralKindTitle = (kind: string, resourceName: string) =>
+    kind.toLowerCase() === resourceName.toLowerCase() ? kind : englishPlural(kind)
+  const pathSegments = pathname.replace(/^\//, '').split('/').filter(Boolean)
+  const view = getViewFromPath(pathname)
+
+  // Full-page resource detail: /workload/<kind>/<ns>/<name> (name may contain '/').
+  if (view === 'workload') return pathSegments.slice(3).map(decode).join('/') || null
+  // Resources is browsed per-kind: /resources/<kind> → "<Kind>" (e.g. ConfigMap);
+  // bare /resources (before it redirects to a default kind) → "Resources".
+  if (view === 'resources') {
+    const resourceName = decode(pathSegments[1] ?? '')
+    if (!resourceName) return 'Resources'
+    const match = apiResources?.find((r) => r.name === resourceName)
+    return pluralKindTitle(match?.kind ?? pluralToKind(resourceName), resourceName)
+  }
+  // GitOps detail is /gitops/detail/<kind>/<ns>/<name> → the resource name;
+  // anything else (the list) → "GitOps".
+  if (view === 'gitops')
+    return pathSegments[1] === 'detail' ? decode(pathSegments[4] ?? '') || 'GitOps' : 'GitOps'
+  if (view === 'applications') {
+    const appKey = new URLSearchParams(search).get('app')
+    if (!appKey) return 'Applications'
+    const decoded = decode(appKey)
+    const slash = decoded.lastIndexOf('/')
+    return slash >= 0 && slash < decoded.length - 1 ? decoded.slice(slash + 1) : decoded
+  }
+
+  // The landing view reads "Overview" rather than "Home" in the tab.
+  if (view === 'home') return 'Overview'
+  // Every other view's label is its id capitalized — getViewFromPath has already
+  // normalized aliases (e.g. /audit → 'checks'), so no lookup table is needed.
+  return capitalize(view)
+}
+
 function AuthBarrier({ authMode }: { authMode: string }) {
   useEffect(() => {
     if (authMode === 'oidc') {
@@ -186,7 +236,7 @@ function peekOwnerKey(pathname: string, search: string): string {
   return `${pathname}\n${new URLSearchParams(search).get('app') ?? ''}`
 }
 
-function AppInner() {
+function AppInner({ manageDocumentTitle = false, documentTitleSuffix }: { manageDocumentTitle?: boolean; documentTitleSuffix?: string }) {
   const navigate = useNavigate()
   const location = useLocation()
   const navigationType = useNavigationType()
@@ -279,6 +329,18 @@ function AppInner() {
 
   // Get mainView from URL path
   const mainView = getViewFromPath(location.pathname)
+
+  // Initialize the kind→plural discovery map app-wide (not just on ResourcesView
+  // mount) so the omnibar can open a CRD hit with an irregular plural from any
+  // view — kindToPlural would otherwise English-guess the route before a
+  // resources view has run initNavigationMap().
+  const { data: navApiResources } = useAPIResources()
+  useEffect(() => { if (navApiResources) initNavigationMap(navApiResources) }, [navApiResources])
+
+  // One URL-derived tab title for every view (see radarPageTitle). Driving it
+  // from the URL — not the mounted component. Off unless the host opts in
+  // (standalone passes manageDocumentTitle), so embedders keep title ownership.
+  useDocumentTitle(manageDocumentTitle ? radarPageTitle(location.pathname, location.search, navApiResources) : null, documentTitleSuffix)
 
   // Workload slug after `/resources/` (defaults to `pods`). Bare `/resources` redirects to `/resources/pods`.
   const normalizedResourcesKindSlug = useMemo(() => {
@@ -582,12 +644,6 @@ function AppInner() {
   const namespaceSwitcherRef = useRef<NamespaceSwitcherHandle>(null)
   const omnibarRef = useRef<OmnibarHandle>(null)
 
-  // Initialize the kind→plural discovery map app-wide (not just on ResourcesView
-  // mount) so the omnibar can open a CRD hit with an irregular plural from any
-  // view — kindToPlural would otherwise English-guess the route before a
-  // resources view has run n().
-  const { data: navApiResources } = useAPIResources()
-  useEffect(() => { if (navApiResources) initNavigationMap(navApiResources) }, [navApiResources])
   const contextSwitcherRef = useRef<ContextSwitcherHandle>(null)
 
   // View switching keyboard shortcuts
@@ -2208,14 +2264,14 @@ function FloatingButtons({ showHelp, showCommandPalette, showDiagnostics, onHelp
 }
 
 // Main App component wrapped with providers
-function App() {
+function App({ manageDocumentTitle = false, documentTitleSuffix }: { manageDocumentTitle?: boolean; documentTitleSuffix?: string }) {
   return (
     <ConnectionProvider>
       <CapabilitiesProvider>
         <ContextSwitchProvider>
           <DockProvider>
             <KeyboardShortcutProvider>
-              <AppInner />
+              <AppInner manageDocumentTitle={manageDocumentTitle} documentTitleSuffix={documentTitleSuffix} />
             </KeyboardShortcutProvider>
           </DockProvider>
         </ContextSwitchProvider>

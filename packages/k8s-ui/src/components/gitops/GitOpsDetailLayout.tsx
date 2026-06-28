@@ -184,11 +184,11 @@ export interface GitOpsDetailLayoutProps {
   isFleetContext?: boolean
   destinationCluster?: { id: string; name: string }
 
-  // Tab-title side effect — sets document.title to "<name> — Radar" while
+  // Tab-title side effect — sets document.title to "<name> · Radar" while
   // mounted, restores on unmount. Opt-in so hub-web fleet detail can pick
   // its own title format ("<name> — Fleet GitOps").
   manageDocumentTitle?: boolean
-  documentTitleSuffix?: string                // defaults to " — Radar"
+  documentTitleSuffix?: string                // defaults to " · Radar"
 
   // Children slot — for dialogs (SyncOptionsDialog, RollbackDialog, …)
   // that should portal to body. Caller owns dialog state. Children render
@@ -246,7 +246,7 @@ export function GitOpsDetailLayout(props: GitOpsDetailLayoutProps) {
   useEffect(() => {
     if (!manageDocumentTitle) return
     const previous = document.title
-    const suffix = documentTitleSuffix ?? ' — Radar'
+    const suffix = documentTitleSuffix ?? ' · Radar'
     document.title = `${identity.name}${suffix}`
     return () => { document.title = previous }
   }, [identity.name, manageDocumentTitle, documentTitleSuffix])

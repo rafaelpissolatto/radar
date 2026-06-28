@@ -155,10 +155,12 @@ window.addEventListener('mouseup', (e: MouseEvent) => {
 }, true)
 
 
-// Standalone Radar binary: same-origin API, router at root. Library consumers
-// (e.g. radar-hub-web) render <RadarApp apiBase="..." basename="..." /> instead.
+// Standalone Radar binary: same-origin API, router at root. It owns the whole
+// tab, so it opts into per-view document.title. Library consumers (e.g.
+// radar-hub-web) render <RadarApp apiBase="..." basename="..." /> WITHOUT this
+// flag, keeping their own tab title.
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
-    <RadarApp />
+    <RadarApp manageDocumentTitle />
   </React.StrictMode>
 )
