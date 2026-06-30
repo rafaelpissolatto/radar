@@ -4,25 +4,24 @@ import { FetchResult, useDockReservedHeight, compareVersions } from '@skyhook-io
 import { startViewTransitionSafe } from '@skyhook-io/k8s-ui/utils/view-transition'
 import { TRANSITION_DRAWER } from '../../utils/animation'
 import { useRefreshAnimation } from '../../hooks/useRefreshAnimation'
-import { X, Copy, Check, RefreshCw, Package, Code, History, FileText, Settings, Link2, Anchor, GitFork, BookOpen, ArrowUpCircle, Trash2, GitBranch, AlertTriangle, RotateCcw, Clock, GitCompare, Plus, Minus, Equal } from 'lucide-react'
+import { X, Copy, Check, RefreshCw, Package, Code, History, Settings, Link2, Anchor, GitFork, BookOpen, ArrowUpCircle, Trash2, GitBranch, AlertTriangle, RotateCcw, Clock, GitCompare, ExternalLink } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import { clsx } from 'clsx'
-import { useHelmRelease, useHelmManifest, useHelmValues, useHelmManifestDiff, useHelmValuesDiff, useHelmNotesDiff, useHelmResourceDiff, useHelmUpgradeInfo, useHelmReleaseVersions, useHelmUninstall, upgradeWithProgress, rollbackWithProgress } from '../../api/client'
+import { useHelmRelease, useHelmManifest, useHelmValues, useHelmUpgradeInfo, useHelmReleaseVersions, useHelmUninstall, upgradeWithProgress, rollbackWithProgress } from '../../api/client'
 import { useQueryClient } from '@tanstack/react-query'
 import { ConfirmDialog } from '../ui/ConfirmDialog'
 import { Tooltip } from '../ui/Tooltip'
 import { Markdown } from '../ui/Markdown'
-import type { SelectedHelmRelease, HelmHook, ChartDependency, HelmOperation, HelmRevision, ResourceDiff, HookDiagnostic, HookLogEvidence } from '../../types'
-import type { NavigateToResource } from '../../utils/navigation'
+import type { SelectedHelmRelease, HelmHook, ChartDependency, HelmOperation, HelmOperationInsight, HelmOwnedResource, HookDiagnostic, HookLogEvidence } from '../../types'
+import { apiVersionToGroup, kindToPlural, type NavigateToResource } from '../../utils/navigation'
 import { formatDate } from './helm-utils'
-import { getHelmStatusColor, SEVERITY_BADGE, SEVERITY_TEXT } from '../../utils/badge-colors'
+import { getHelmStatusColor, getKindBadgeColor, getResourceStatusColor, SEVERITY_BADGE, SEVERITY_TEXT } from '../../utils/badge-colors'
 import { useCanHelmAct, useCloudRole } from '../../api/client'
 import { RoleGatedPanel } from './RoleGatedPanel'
 import { RevisionHistory } from './RevisionHistory'
 import { ManifestViewer } from './ManifestViewer'
 import { ValuesViewer } from './ValuesViewer'
 import { OwnedResources } from './OwnedResources'
-import { ManifestDiffViewer } from './ManifestDiffViewer'
 import { TrackChartSourceDialog } from './TrackChartSourceDialog'
 
 interface HelmReleaseDrawerProps {
@@ -33,8 +32,7 @@ interface HelmReleaseDrawerProps {
   isOpen?: boolean
 }
 
-type TabId = 'overview' | 'history' | 'manifest' | 'values' | 'resources' | 'hooks' | 'diff'
-type CompareMode = 'summary' | 'values' | 'manifest' | 'notes' | 'resources'
+type TabId = 'overview' | 'history' | 'manifest' | 'values' | 'resources' | 'hooks'
 
 const MIN_WIDTH = 500
 const MAX_WIDTH_PERCENT = 0.8
@@ -49,8 +47,6 @@ export function HelmReleaseDrawer({ release, onClose, onNavigateToResource, isOp
   const [isResizing, setIsResizing] = useState(false)
   const [selectedRevision, setSelectedRevision] = useState<number | undefined>(undefined)
   const [showAllValues, setShowAllValues] = useState(false)
-  const [diffRevisions, setDiffRevisions] = useState<{ rev1: number; rev2: number } | null>(null)
-  const [compareMode, setCompareMode] = useState<CompareMode>('summary')
   const [rollbackRevision, setRollbackRevision] = useState<number | null>(null)
   const [showUninstallConfirm, setShowUninstallConfirm] = useState(false)
   const [showUpgradeConfirm, setShowUpgradeConfirm] = useState(false)
@@ -88,37 +84,6 @@ export function HelmReleaseDrawer({ release, onClose, onNavigateToResource, isOp
     showAllValues,
     canViewSensitive,
     selectedRevision,
-  )
-
-  // Fetch diff if comparing revisions
-  const { data: diffData, isLoading: diffLoading } = useHelmManifestDiff(
-    helmNamespace,
-    release.name,
-    diffRevisions?.rev1 || 0,
-    diffRevisions?.rev2 || 0,
-    canViewSensitive && compareMode === 'manifest',
-  )
-  const { data: valuesDiffData, isLoading: valuesDiffLoading } = useHelmValuesDiff(
-    helmNamespace,
-    release.name,
-    diffRevisions?.rev1 || 0,
-    diffRevisions?.rev2 || 0,
-    false,
-    canViewSensitive && compareMode === 'values',
-  )
-  const { data: notesDiffData, isLoading: notesDiffLoading } = useHelmNotesDiff(
-    helmNamespace,
-    release.name,
-    diffRevisions?.rev1 || 0,
-    diffRevisions?.rev2 || 0,
-    canViewSensitive && compareMode === 'notes',
-  )
-  const { data: resourceDiffData, isLoading: resourceDiffLoading } = useHelmResourceDiff(
-    helmNamespace,
-    release.name,
-    diffRevisions?.rev1 || 0,
-    diffRevisions?.rev2 || 0,
-    canViewSensitive && compareMode === 'resources',
   )
 
   // Lazy check for upgrade availability
@@ -213,11 +178,16 @@ export function HelmReleaseDrawer({ release, onClose, onNavigateToResource, isOp
     startViewTransitionSafe(() => flushSync(() => setActiveTab(tab)))
   }, [])
 
-  const handleCompareRevisions = (rev1: number, rev2: number) => {
-    setDiffRevisions({ rev1, rev2 })
-    setCompareMode('summary')
-    switchTab('diff')
-  }
+  const handleCompareRevisions = useCallback((rev1: number, rev2: number) => {
+    const params = new URLSearchParams()
+    const globalNamespaces = new URLSearchParams(window.location.search).get('namespaces')
+    if (globalNamespaces) params.set('namespaces', globalNamespaces)
+    params.set('release', `${release.namespace}/${release.name}`)
+    if (release.storageNamespace) params.set('releaseStorage', release.storageNamespace)
+    params.set('revision1', String(rev1))
+    params.set('revision2', String(rev2))
+    navigate({ pathname: '/helm/compare', search: params.toString() })
+  }, [navigate, release.name, release.namespace, release.storageNamespace])
 
   const handleViewRevision = (revision: number) => {
     setSelectedRevision(revision)
@@ -347,11 +317,6 @@ export function HelmReleaseDrawer({ release, onClose, onNavigateToResource, isOp
     { id: 'resources', label: 'Resources', icon: Link2 },
     { id: 'hooks', label: 'Hooks', icon: Anchor },
   ]
-
-  // Add diff tab only when comparing
-  if (diffRevisions) {
-    tabs.push({ id: 'diff', label: 'Compare', icon: GitCompare })
-  }
 
   return (
     <div
@@ -555,8 +520,13 @@ export function HelmReleaseDrawer({ release, onClose, onNavigateToResource, isOp
           <>
             <HelmOperationBanner
               operation={releaseDetail.lastOperation}
+              operationInsight={releaseDetail.operationInsight}
+              releaseNamespace={releaseDetail.namespace}
               managedByFluxHelmRelease={releaseDetail.managedByFluxHelmRelease}
               hookDiagnostics={releaseDetail.hookDiagnostics}
+              canCompare={canViewSensitive}
+              onCompare={handleCompareRevisions}
+              onNavigateToResource={onNavigateToResource}
             />
             {activeTab === 'overview' && (
               <OverviewTab release={releaseDetail} onCopy={copyToClipboard} copied={copied} />
@@ -607,30 +577,6 @@ export function HelmReleaseDrawer({ release, onClose, onNavigateToResource, isOp
             )}
             {activeTab === 'hooks' && (
               <HooksTab hooks={releaseDetail.hooks || []} hookDiagnostics={releaseDetail.hookDiagnostics || []} />
-            )}
-            {activeTab === 'diff' && diffRevisions && (
-              <RoleGatedPanel min="member" feature="release revision comparison">
-                <HelmRevisionCompareView
-                  revisions={releaseDetail.history}
-                  revision1={diffRevisions.rev1}
-                  revision2={diffRevisions.rev2}
-                  mode={compareMode}
-                  onModeChange={setCompareMode}
-                  manifestDiff={diffData?.diff || ''}
-                  manifestLoading={diffLoading}
-                  valuesDiff={valuesDiffData?.diff || ''}
-                  valuesLoading={valuesDiffLoading}
-                  notesDiff={notesDiffData?.diff || ''}
-                  notesLoading={notesDiffLoading}
-                  resourceDiff={resourceDiffData}
-                  resourceLoading={resourceDiffLoading}
-                  onClose={() => {
-                    setDiffRevisions(null)
-                    setCompareMode('summary')
-                    setActiveTab('history')
-                  }}
-                />
-              </RoleGatedPanel>
             )}
           </>
         )}
@@ -783,278 +729,6 @@ function mergeHelmOperations(operations: HelmOperation[] | undefined, lastOperat
   return merged
 }
 
-interface HelmRevisionCompareViewProps {
-  revisions: HelmRevision[]
-  revision1: number
-  revision2: number
-  mode: CompareMode
-  onModeChange: (mode: CompareMode) => void
-  manifestDiff: string
-  manifestLoading: boolean
-  valuesDiff: string
-  valuesLoading: boolean
-  notesDiff: string
-  notesLoading: boolean
-  resourceDiff?: ResourceDiff
-  resourceLoading: boolean
-  onClose: () => void
-}
-
-function HelmRevisionCompareView({
-  revisions,
-  revision1,
-  revision2,
-  mode,
-  onModeChange,
-  manifestDiff,
-  manifestLoading,
-  valuesDiff,
-  valuesLoading,
-  notesDiff,
-  notesLoading,
-  resourceDiff,
-  resourceLoading,
-  onClose,
-}: HelmRevisionCompareViewProps) {
-  const left = revisions.find((r) => r.revision === revision1)
-  const right = revisions.find((r) => r.revision === revision2)
-  const modes: Array<{ id: CompareMode; label: string; icon: typeof GitCompare }> = [
-    { id: 'summary', label: 'Summary', icon: GitCompare },
-    { id: 'values', label: 'Values', icon: Settings },
-    { id: 'manifest', label: 'Manifest', icon: Code },
-    { id: 'notes', label: 'Notes', icon: FileText },
-    { id: 'resources', label: 'Resources', icon: Link2 },
-  ]
-
-  return (
-    <div className="p-4">
-      <div className="mb-3 flex items-center justify-between gap-3">
-        <div className="min-w-0">
-          <div className="flex items-center gap-2">
-            <GitCompare className="h-4 w-4 text-theme-text-secondary" />
-            <span className="text-sm font-medium text-theme-text-primary">Revision {revision1} -&gt; {revision2}</span>
-          </div>
-          <p className="mt-1 text-xs text-theme-text-tertiary">
-            Compare rendered output and release metadata between two Helm revisions.
-          </p>
-        </div>
-        <button
-          onClick={onClose}
-          className="flex items-center gap-1 px-2 py-1 text-xs text-theme-text-secondary hover:text-theme-text-primary hover:bg-theme-elevated rounded"
-        >
-          <X className="w-3.5 h-3.5" />
-          Close
-        </button>
-      </div>
-
-      <div className="mb-4 flex flex-wrap gap-1 rounded-lg bg-theme-base/50 p-1">
-        {modes.map((item) => (
-          <button
-            key={item.id}
-            onClick={() => onModeChange(item.id)}
-            className={clsx(
-              'flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs transition-colors',
-              mode === item.id
-                ? 'bg-theme-elevated text-theme-text-primary shadow-theme-sm'
-                : 'text-theme-text-secondary hover:bg-theme-hover/70 hover:text-theme-text-primary'
-            )}
-          >
-            <item.icon className="h-3.5 w-3.5" />
-            {item.label}
-          </button>
-        ))}
-      </div>
-
-      {mode === 'summary' && <RevisionCompareSummary left={left} right={right} revision1={revision1} revision2={revision2} />}
-      {mode === 'values' && (
-        <ManifestDiffViewer
-          diff={valuesDiff}
-          isLoading={valuesLoading}
-          revision1={revision1}
-          revision2={revision2}
-          title={`Values diff: Revision ${revision1} -> ${revision2}`}
-          emptyLabel="No user-supplied value changes found"
-          onClose={onClose}
-        />
-      )}
-      {mode === 'manifest' && (
-        <ManifestDiffViewer
-          diff={manifestDiff}
-          isLoading={manifestLoading}
-          revision1={revision1}
-          revision2={revision2}
-          title={`Manifest diff: Revision ${revision1} -> ${revision2}`}
-          onClose={onClose}
-        />
-      )}
-      {mode === 'notes' && (
-        <ManifestDiffViewer
-          diff={notesDiff}
-          isLoading={notesLoading}
-          revision1={revision1}
-          revision2={revision2}
-          title={`Notes diff: Revision ${revision1} -> ${revision2}`}
-          emptyLabel="No release notes changes found"
-          onClose={onClose}
-        />
-      )}
-      {mode === 'resources' && (
-        <ResourceDiffView diff={resourceDiff} isLoading={resourceLoading} revision1={revision1} revision2={revision2} />
-      )}
-    </div>
-  )
-}
-
-function RevisionCompareSummary({
-  left,
-  right,
-  revision1,
-  revision2,
-}: {
-  left?: HelmRevision
-  right?: HelmRevision
-  revision1: number
-  revision2: number
-}) {
-  return (
-    <div className="space-y-4">
-      <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-        <RevisionSummaryCard revision={left} fallbackRevision={revision1} label="From" />
-        <RevisionSummaryCard revision={right} fallbackRevision={revision2} label="To" />
-      </div>
-      <div className="card-inner-lg">
-        <h3 className="text-sm font-medium text-theme-text-secondary">Changed fields</h3>
-        <div className="mt-3 grid grid-cols-1 gap-2 text-sm md:grid-cols-2">
-          <RevisionFieldDelta label="Chart" left={left?.chart} right={right?.chart} />
-          <RevisionFieldDelta label="App version" left={left?.appVersion || '-'} right={right?.appVersion || '-'} />
-          <RevisionFieldDelta label="Status" left={left?.status} right={right?.status} />
-          <RevisionFieldDelta label="Description" left={left?.description || '-'} right={right?.description || '-'} />
-        </div>
-      </div>
-    </div>
-  )
-}
-
-function RevisionSummaryCard({ revision, fallbackRevision, label }: { revision?: HelmRevision; fallbackRevision: number; label: string }) {
-  return (
-    <div className="card-inner-lg">
-      <div className="flex items-center justify-between gap-2">
-        <span className="text-xs font-medium uppercase tracking-wide text-theme-text-tertiary">{label}</span>
-        <span className="badge-sm bg-theme-hover/50 text-theme-text-secondary">rev {revision?.revision || fallbackRevision}</span>
-      </div>
-      <div className="mt-3 space-y-2 text-sm">
-        <div className="flex items-center justify-between gap-3">
-          <span className="text-theme-text-tertiary">Chart</span>
-          <span className="truncate text-theme-text-primary">{revision?.chart || '-'}</span>
-        </div>
-        <div className="flex items-center justify-between gap-3">
-          <span className="text-theme-text-tertiary">Status</span>
-          <span className={clsx('badge-sm', revision ? getHelmStatusColor(revision.status) : SEVERITY_BADGE.neutral)}>
-            {revision?.status || 'unknown'}
-          </span>
-        </div>
-        <div className="flex items-center justify-between gap-3">
-          <span className="text-theme-text-tertiary">Updated</span>
-          <span className="text-theme-text-secondary">{revision?.updated ? formatDate(revision.updated) : '-'}</span>
-        </div>
-      </div>
-    </div>
-  )
-}
-
-function RevisionFieldDelta({ label, left, right }: { label: string; left?: string; right?: string }) {
-  const changed = (left || '') !== (right || '')
-  return (
-    <div className="rounded-md bg-theme-base/40 p-2">
-      <div className="mb-1 flex items-center justify-between gap-2">
-        <span className="text-xs text-theme-text-tertiary">{label}</span>
-        <span className={clsx('badge-sm', changed ? SEVERITY_BADGE.info : SEVERITY_BADGE.neutral)}>
-          {changed ? 'changed' : 'same'}
-        </span>
-      </div>
-      <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-2 text-xs">
-        <span className="truncate text-theme-text-secondary">{left || '-'}</span>
-        <span className="text-theme-text-tertiary">-&gt;</span>
-        <span className="truncate text-theme-text-primary">{right || '-'}</span>
-      </div>
-    </div>
-  )
-}
-
-function ResourceDiffView({
-  diff,
-  isLoading,
-  revision1,
-  revision2,
-}: {
-  diff?: ResourceDiff
-  isLoading: boolean
-  revision1: number
-  revision2: number
-}) {
-  if (isLoading) {
-    return <FetchResult loading className="h-32" />
-  }
-  if (!diff) {
-    return <FetchResult loading={false} notFoundMessage="Resource diff not available" className="h-32" />
-  }
-  return (
-    <div className="space-y-3">
-      <div className="text-sm font-medium text-theme-text-secondary">
-        Resource set diff: Revision {revision1} -&gt; {revision2}
-      </div>
-      <ResourceDiffGroup title="Added" icon={Plus} tone="success" resources={diff.added} />
-      <ResourceDiffGroup title="Removed" icon={Minus} tone="error" resources={diff.removed} />
-      <ResourceDiffGroup title="Unchanged" icon={Equal} tone="neutral" resources={diff.unchanged} collapsed />
-    </div>
-  )
-}
-
-function ResourceDiffGroup({
-  title,
-  icon: Icon,
-  tone,
-  resources,
-  collapsed = false,
-}: {
-  title: string
-  icon: typeof Plus
-  tone: keyof typeof SEVERITY_BADGE
-  resources: ResourceDiff['added']
-  collapsed?: boolean
-}) {
-  const items = resources || []
-  const visible = collapsed ? items.slice(0, 12) : items
-  return (
-    <div className="card-inner-lg">
-      <div className="mb-2 flex items-center justify-between gap-2">
-        <div className="flex items-center gap-2">
-          <Icon className="h-4 w-4 text-theme-text-secondary" />
-          <span className="text-sm font-medium text-theme-text-primary">{title}</span>
-        </div>
-        <span className={clsx('badge-sm', SEVERITY_BADGE[tone])}>{items.length}</span>
-      </div>
-      {items.length === 0 ? (
-        <div className="text-sm text-theme-text-tertiary">None</div>
-      ) : (
-        <div className="space-y-1">
-          {visible.map((resource) => (
-            <div key={`${resource.apiVersion}/${resource.kind}/${resource.namespace}/${resource.name}`} className="grid grid-cols-[110px_1fr] gap-2 rounded bg-theme-base/40 px-2 py-1 text-xs">
-              <span className="text-theme-text-tertiary">{resource.kind}</span>
-              <span className="truncate text-theme-text-primary">
-                {resource.namespace ? `${resource.namespace}/` : ''}{resource.name}
-              </span>
-            </div>
-          ))}
-          {visible.length < items.length && (
-            <div className="text-xs text-theme-text-tertiary">+{items.length - visible.length} more unchanged resources</div>
-          )}
-        </div>
-      )}
-    </div>
-  )
-}
-
 function helmOperationKey(operation: HelmOperation): string {
   return [
     operation.kind,
@@ -1068,12 +742,22 @@ function helmOperationKey(operation: HelmOperation): string {
 
 function HelmOperationBanner({
   operation,
+  operationInsight,
+  releaseNamespace,
   managedByFluxHelmRelease,
   hookDiagnostics,
+  canCompare,
+  onCompare,
+  onNavigateToResource,
 }: {
   operation?: HelmOperation
+  operationInsight?: HelmOperationInsight
+  releaseNamespace: string
   managedByFluxHelmRelease?: string
   hookDiagnostics?: HookDiagnostic[]
+  canCompare?: boolean
+  onCompare?: (rev1: number, rev2: number) => void
+  onNavigateToResource?: NavigateToResource
 }) {
   const primaryHookDiagnostic = hookDiagnostics?.[0]
   if ((!operation || !shouldShowOperationBanner(operation)) && !primaryHookDiagnostic) {
@@ -1119,15 +803,24 @@ function HelmOperationBanner({
           </div>
           <p className="mt-1 text-sm text-theme-text-secondary">{operation.message}</p>
           {operation.failureDescription && (
-            <p className="mt-1 text-xs text-theme-text-tertiary truncate">
-              {operation.failureDescription}
-            </p>
+            <Tooltip content={operation.failureDescription} wrapperClassName="mt-1 flex">
+              <span className="line-clamp-2 text-xs text-theme-text-tertiary">
+                {operation.failureDescription}
+              </span>
+            </Tooltip>
           )}
           {operation.kind === 'upgrade_rolled_back' && (
             <p className="mt-1 text-xs text-theme-text-tertiary">
               Helm history does not record whether <code className="inline-code text-[11px]">--atomic</code> was set; the rollback is inferred from adjacent release revisions.
             </p>
           )}
+          <OperationInsightSignals
+            insight={operationInsight}
+            releaseNamespace={releaseNamespace}
+            canCompare={Boolean(canCompare)}
+            onCompare={onCompare}
+            onNavigateToResource={onNavigateToResource}
+          />
           {primaryHookDiagnostic && <HookSignal diagnostic={primaryHookDiagnostic} />}
           {managedByFluxHelmRelease && (
             <p className="mt-1 text-xs text-theme-text-tertiary">
@@ -1136,6 +829,125 @@ function HelmOperationBanner({
           )}
         </div>
       </div>
+    </div>
+  )
+}
+
+function OperationInsightSignals({
+  insight,
+  releaseNamespace,
+  canCompare,
+  onCompare,
+  onNavigateToResource,
+}: {
+  insight?: HelmOperationInsight
+  releaseNamespace: string
+  canCompare: boolean
+  onCompare?: (rev1: number, rev2: number) => void
+  onNavigateToResource?: NavigateToResource
+}) {
+  const compare = insight?.suggestedCompare
+  const primaryResource = insight?.primaryResource
+  const relatedCount = primaryResource
+    ? Math.max(0, (insight?.signalCount ?? 0) - 1)
+    : insight?.relatedResources?.length ?? 0
+  const showCompare = Boolean(compare && canCompare && onCompare)
+  if (!primaryResource && !showCompare) {
+    return null
+  }
+
+  return (
+    <div className="mt-2 space-y-2">
+      {primaryResource && (
+        <PrimaryOperationResourceSignal
+          resource={primaryResource}
+          releaseNamespace={releaseNamespace}
+          relatedCount={relatedCount}
+          onNavigateToResource={onNavigateToResource}
+        />
+      )}
+      {showCompare && compare && (
+        <Tooltip content={compare.reason || 'Compare the two Helm revisions'}>
+          <button
+            type="button"
+            onClick={() => onCompare?.(compare.revision1, compare.revision2)}
+            className="inline-flex items-center gap-1.5 rounded-md border border-theme-border-light bg-theme-elevated px-2.5 py-1.5 text-xs font-medium text-theme-text-primary shadow-theme-sm transition-colors hover:bg-theme-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+          >
+            <GitCompare className="h-3.5 w-3.5" />
+            Compare rev {compare.revision1} to {compare.revision2}
+          </button>
+        </Tooltip>
+      )}
+    </div>
+  )
+}
+
+function PrimaryOperationResourceSignal({
+  resource,
+  releaseNamespace,
+  relatedCount,
+  onNavigateToResource,
+}: {
+  resource: HelmOwnedResource
+  releaseNamespace: string
+  relatedCount: number
+  onNavigateToResource?: NavigateToResource
+}) {
+  const canNavigate = Boolean(onNavigateToResource)
+  const resourceLabel = `${resource.kind}/${resource.name}`
+  const resourceTarget = resource.namespace ? `${resource.namespace}/${resource.name}` : resource.name
+  const showNamespace = Boolean(resource.namespace && resource.namespace !== releaseNamespace)
+  const resourceTooltip = `Open ${resource.kind} ${resourceTarget}`
+  const showInlineReady = Boolean(resource.ready && !resource.summary)
+  const openResource = () => {
+    onNavigateToResource?.({
+      kind: kindToPlural(resource.kind),
+      namespace: resource.namespace,
+      name: resource.name,
+      group: apiVersionToGroup(resource.apiVersion),
+    })
+  }
+
+  return (
+    <div className="rounded-md bg-theme-base/50 p-2 text-xs">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="font-medium text-theme-text-secondary">Likely resource to inspect</span>
+        {canNavigate ? (
+          <Tooltip content={resourceTooltip}>
+            <button
+              type="button"
+              onClick={openResource}
+              aria-label={resourceTooltip}
+              className={clsx(
+                'badge-sm max-w-full min-w-0 transition-colors hover:brightness-95 focus:outline-none focus:ring-2 focus:ring-accent focus:ring-offset-1 focus:ring-offset-theme-base',
+                getKindBadgeColor(resource.kind)
+              )}
+            >
+              <span className="min-w-0 truncate">{resourceLabel}</span>
+              <ExternalLink className="h-3 w-3 shrink-0 opacity-70" />
+            </button>
+          </Tooltip>
+        ) : (
+          <span className={clsx('badge-sm max-w-full min-w-0', getKindBadgeColor(resource.kind))}>
+            <span className="min-w-0 truncate">{resourceLabel}</span>
+          </span>
+        )}
+        {showNamespace && <span className="text-theme-text-tertiary">ns/{resource.namespace}</span>}
+        {showInlineReady && <span className="font-mono text-theme-text-secondary">{resource.ready}</span>}
+        {resource.status && (
+          <span className={clsx('badge-sm', getResourceStatusColor(resource.status))}>{resource.status}</span>
+        )}
+      </div>
+      {(resource.issue || resource.summary || resource.message || relatedCount > 0) && (
+        <div className="mt-1 text-theme-text-tertiary">
+          {[
+            resource.issue || resource.summary || resource.message,
+            relatedCount > 0 ? `${relatedCount} more affected resource${relatedCount === 1 ? '' : 's'} in Resources tab` : null,
+          ]
+            .filter(Boolean)
+            .join(' - ')}
+        </div>
+      )}
     </div>
   )
 }

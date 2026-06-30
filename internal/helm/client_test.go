@@ -573,6 +573,319 @@ func TestDiffResourceRefs(t *testing.T) {
 	}
 }
 
+func TestDiffHooks(t *testing.T) {
+	now := time.Date(2026, 6, 29, 12, 0, 0, 0, time.UTC)
+	later := now.Add(time.Minute)
+	left := []HelmHook{
+		{Name: "migrate", Namespace: "demo", Kind: "Job", Events: []string{"pre-upgrade"}, Weight: 0, Status: "Succeeded", StartedAt: &now, CompletedAt: &now},
+		{Name: "cleanup", Namespace: "demo", Kind: "Job", Events: []string{"post-delete"}, Weight: 0, Status: "Succeeded"},
+		{Name: "seed", Namespace: "demo", Kind: "Job", Events: []string{"post-install", "post-upgrade"}, DeletePolicies: []string{"hook-succeeded", "before-hook-creation"}, Weight: 0, Status: "Succeeded"},
+		{Name: "schema", Namespace: "demo", Kind: "Job", Events: []string{"pre-upgrade"}, Weight: 0, ManifestDigest: "old-body"},
+	}
+	right := []HelmHook{
+		{Name: "migrate", Namespace: "demo", Kind: "Job", Events: []string{"pre-upgrade"}, Weight: 10, Status: "Succeeded"},
+		{Name: "seed", Namespace: "demo", Kind: "Job", Events: []string{"post-upgrade", "post-install"}, DeletePolicies: []string{"before-hook-creation", "hook-succeeded"}, Weight: 0, Status: "Failed", StartedAt: &later, CompletedAt: &later},
+		{Name: "schema", Namespace: "demo", Kind: "Job", Events: []string{"pre-upgrade"}, Weight: 0, ManifestDigest: "new-body"},
+		{Name: "verify", Namespace: "demo", Kind: "Job", Events: []string{"post-upgrade"}, Weight: 0, Status: "Succeeded"},
+	}
+
+	removed, added, modified, unchanged := diffHooks(left, right)
+
+	if len(removed) != 1 || removed[0].Name != "cleanup" {
+		t.Fatalf("removed = %#v, want cleanup", removed)
+	}
+	if len(added) != 1 || added[0].Name != "verify" {
+		t.Fatalf("added = %#v, want verify", added)
+	}
+	if len(modified) != 2 {
+		t.Fatalf("modified = %#v, want migrate and schema", modified)
+	}
+	modifiedByName := map[string]HelmHook{}
+	for _, hook := range modified {
+		modifiedByName[hook.Name] = hook
+	}
+	if modifiedByName["migrate"].Weight != 10 {
+		t.Fatalf("modified = %#v, want updated migrate hook", modified)
+	}
+	if modifiedByName["schema"].ManifestDigest != "new-body" || !modifiedByName["schema"].ManifestChanged {
+		t.Fatalf("modified = %#v, want hook body change", modified)
+	}
+	if len(unchanged) != 1 || unchanged[0].Name != "seed" {
+		t.Fatalf("unchanged = %#v, want seed", unchanged)
+	}
+}
+
+func TestDiffRenderedResourceObjectsDetectsModifiedDeploymentFields(t *testing.T) {
+	oldManifest := `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cart
+  namespace: demo
+spec:
+  selector:
+    matchLabels:
+      app: cart
+  template:
+    metadata:
+      labels:
+        app: cart
+    spec:
+      containers:
+      - name: app
+        image: nginx:1.25
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+`
+	newManifest := `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cart
+  namespace: demo
+spec:
+  selector:
+    matchLabels:
+      app: cart
+  template:
+    metadata:
+      labels:
+        app: cart
+    spec:
+      containers:
+      - name: app
+        image: nginx:1.26
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+`
+
+	left, _ := parseManifestResourceObjects(oldManifest, "demo")
+	right, _ := parseManifestResourceObjects(newManifest, "demo")
+	removed, added, common := diffResourceRefs(resourceRefsFromRendered(left), resourceRefsFromRendered(right))
+	modified, unchanged := diffRenderedResourceObjects(common, left, right)
+
+	if len(removed) != 0 || len(added) != 0 || len(unchanged) != 0 {
+		t.Fatalf("removed=%#v added=%#v unchanged=%#v, want only modified", removed, added, unchanged)
+	}
+	if len(modified) != 1 {
+		t.Fatalf("modified = %#v, want one Deployment", modified)
+	}
+	gotPaths := map[string]bool{}
+	for _, field := range modified[0].Fields {
+		gotPaths[field.Path] = true
+	}
+	for _, want := range []string{
+		"spec.template.spec.containers[app].image",
+		"spec.template.spec.containers[app].readinessProbe",
+	} {
+		if !gotPaths[want] {
+			t.Fatalf("modified paths = %#v, missing %s", gotPaths, want)
+		}
+	}
+}
+
+func TestDiffRenderedResourceObjectsIgnoresDeploymentMetadataOnlyChanges(t *testing.T) {
+	oldManifest := `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cart
+  namespace: demo
+  labels:
+    helm.sh/chart: cart-1.0.0
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cart
+  template:
+    metadata:
+      labels:
+        app: cart
+    spec:
+      containers:
+      - name: app
+        image: nginx:1.25
+`
+	newManifest := `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cart
+  namespace: demo
+  labels:
+    helm.sh/chart: cart-1.0.1
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cart
+  template:
+    metadata:
+      labels:
+        app: cart
+    spec:
+      containers:
+      - name: app
+        image: nginx:1.25
+`
+
+	left, _ := parseManifestResourceObjects(oldManifest, "demo")
+	right, _ := parseManifestResourceObjects(newManifest, "demo")
+	_, _, common := diffResourceRefs(resourceRefsFromRendered(left), resourceRefsFromRendered(right))
+	modified, unchanged := diffRenderedResourceObjects(common, left, right)
+
+	if len(modified) != 0 {
+		t.Fatalf("modified = %#v, want metadata-only change ignored", modified)
+	}
+	if len(unchanged) != 1 {
+		t.Fatalf("unchanged = %#v, want one unchanged Deployment", unchanged)
+	}
+}
+
+func TestDiffRenderedResourceObjectsIgnoresGenericHelmChartLabelOnlyChanges(t *testing.T) {
+	oldManifest := `apiVersion: example.com/v1
+kind: Widget
+metadata:
+  name: cart
+  namespace: demo
+  labels:
+    helm.sh/chart: cart-1.0.0
+spec:
+  size: medium
+`
+	newManifest := `apiVersion: example.com/v1
+kind: Widget
+metadata:
+  name: cart
+  namespace: demo
+  labels:
+    helm.sh/chart: cart-1.0.1
+spec:
+  size: medium
+`
+
+	left, _ := parseManifestResourceObjects(oldManifest, "demo")
+	right, _ := parseManifestResourceObjects(newManifest, "demo")
+	_, _, common := diffResourceRefs(resourceRefsFromRendered(left), resourceRefsFromRendered(right))
+	modified, unchanged := diffRenderedResourceObjects(common, left, right)
+
+	if len(modified) != 0 {
+		t.Fatalf("modified = %#v, want Helm chart label-only change ignored", modified)
+	}
+	if len(unchanged) != 1 {
+		t.Fatalf("unchanged = %#v, want one unchanged custom resource", unchanged)
+	}
+}
+
+func TestDiffRenderedResourceObjectsIgnoresGenericHelmChartLabelAdded(t *testing.T) {
+	oldManifest := `apiVersion: example.com/v1
+kind: Widget
+metadata:
+  name: cart
+  namespace: demo
+spec:
+  size: medium
+`
+	newManifest := `apiVersion: example.com/v1
+kind: Widget
+metadata:
+  name: cart
+  namespace: demo
+  labels:
+    helm.sh/chart: cart-1.0.1
+spec:
+  size: medium
+`
+
+	left, _ := parseManifestResourceObjects(oldManifest, "demo")
+	right, _ := parseManifestResourceObjects(newManifest, "demo")
+	_, _, common := diffResourceRefs(resourceRefsFromRendered(left), resourceRefsFromRendered(right))
+	modified, unchanged := diffRenderedResourceObjects(common, left, right)
+
+	if len(modified) != 0 {
+		t.Fatalf("modified = %#v, want Helm chart label add ignored", modified)
+	}
+	if len(unchanged) != 1 {
+		t.Fatalf("unchanged = %#v, want one unchanged custom resource", unchanged)
+	}
+}
+
+func TestParseManifestResourceObjectsUsesMetadataName(t *testing.T) {
+	resources, parseErrors := parseManifestResourceObjects(`apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cart
+spec:
+  template:
+    spec:
+      containers:
+      - name: app
+        image: nginx
+`, "demo")
+
+	if parseErrors != 0 {
+		t.Fatalf("parseErrors = %d, want 0", parseErrors)
+	}
+	if len(resources) != 1 {
+		t.Fatalf("resources = %#v, want one resource", resources)
+	}
+	ref := resources[0].Ref
+	if ref.Name != "cart" || ref.Namespace != "demo" || ref.Kind != "Deployment" || ref.APIVersion != "apps/v1" {
+		t.Fatalf("ref = %#v, want apps/v1 Deployment demo/cart", ref)
+	}
+}
+
+func TestParseManifestResourceObjectsKeepsClusterScopedNamespaceEmpty(t *testing.T) {
+	resources, parseErrors := parseManifestResourceObjects(`apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: chart-reader
+rules: []
+`, "demo")
+
+	if parseErrors != 0 {
+		t.Fatalf("parseErrors = %d, want 0", parseErrors)
+	}
+	if len(resources) != 1 {
+		t.Fatalf("resources = %#v, want one resource", resources)
+	}
+	ref := resources[0].Ref
+	if ref.Name != "chart-reader" || ref.Namespace != "" || ref.Kind != "ClusterRole" || ref.APIVersion != "rbac.authorization.k8s.io/v1" {
+		t.Fatalf("ref = %#v, want rbac.authorization.k8s.io/v1 ClusterRole chart-reader with empty namespace", ref)
+	}
+}
+
+func TestParseManifestResourceObjectsReportsParseErrors(t *testing.T) {
+	resources, parseErrors := parseManifestResourceObjects(`apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: good
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bad
+  labels:
+    broken: [
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ok
+spec:
+  ports:
+  - port: 80
+`, "demo")
+
+	if parseErrors != 1 {
+		t.Fatalf("parseErrors = %d, want 1", parseErrors)
+	}
+	if len(resources) != 2 {
+		t.Fatalf("resources = %#v, want two parsed resources", resources)
+	}
+}
+
 type failSecondReadDriver struct {
 	inner *storagedriver.Memory
 	reads int

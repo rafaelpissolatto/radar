@@ -1,6 +1,5 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { flushSync } from 'react-dom'
-import { useRefreshAnimation } from './hooks/useRefreshAnimation'
 import { startViewTransitionSafe } from '@skyhook-io/k8s-ui/utils/view-transition'
 import { englishPlural } from '@skyhook-io/k8s-ui/utils/pluralize'
 import { useQueryClient } from '@tanstack/react-query'
@@ -17,6 +16,7 @@ import { ResourceDetailDrawer } from './components/resources/ResourceDetailDrawe
 import { WorkloadViewRoute } from './components/workload/WorkloadView'
 import { CompareViewRoute } from './components/compare/CompareViewRoute'
 import { HelmView } from './components/helm/HelmView'
+import { HelmCompareRoute } from './components/helm/HelmCompareRoute'
 import { TrafficView } from './components/traffic/TrafficView'
 import { CostView } from './components/cost/CostView'
 import { AuditView } from './components/audit/AuditView'
@@ -105,10 +105,11 @@ const FLEET_MODE_KINDS = new Set<NodeKind>([
 
 // Convert API resource name back to topology node ID prefix
 // Extended MainView type that includes traffic and cost
-type ExtendedMainView = MainView | 'traffic' | 'cost' | 'workload' | 'checks' | 'gitops' | 'compare' | 'issues' | 'applications'
+type ExtendedMainView = MainView | 'traffic' | 'cost' | 'workload' | 'checks' | 'gitops' | 'compare' | 'helmCompare' | 'issues' | 'applications'
 
 // Extract view from URL path
 function getViewFromPath(pathname: string): ExtendedMainView {
+  if (pathname.replace(/\/+$/, '') === '/helm/compare') return 'helmCompare'
   const path = pathname.replace(/^\//, '').split('/')[0]
   if (path === '' || path === 'home') return 'home'
   if (path === 'topology') return 'topology'
@@ -701,7 +702,7 @@ function AppInner({ manageDocumentTitle = false, documentTitleSuffix }: { manage
     gitops: 'g o', checks: 'g u', cost: 'g c',
     // Non-rail views (reachable via deep links / actions, not the rail) get no
     // dedicated mnemonic — listed for exhaustiveness so the type stays total.
-    workload: '', compare: '',
+    workload: '', compare: '', helmCompare: '',
   }
   const views = Object.keys(VIEW_SHORTCUT_KEYS).filter(
     (v): v is ExtendedMainView => VIEW_SHORTCUT_KEYS[v as ExtendedMainView] !== '',
@@ -943,7 +944,7 @@ function AppInner({ manageDocumentTitle = false, documentTitleSuffix }: { manage
   // forceNamespaceFilter is only set for large clusters that require server-side filtering.
   // Fleet mode uses 'resources' topology on the backend — filtering is client-side
   const sseMode = topologyMode === 'fleet' ? 'resources' : topologyMode
-  const { topology, connected, reconnect: reconnectSSE } = useEventSource(namespaces, sseMode as 'resources' | 'traffic', {
+  const { topology } = useEventSource(namespaces, sseMode as 'resources' | 'traffic', {
     onContextSwitchComplete: endSwitch,
     onContextSwitchProgress: updateProgress,
     onContextChanged: () => {
@@ -980,7 +981,7 @@ function AppInner({ manageDocumentTitle = false, documentTitleSuffix }: { manage
     },
     onK8sEvent: handleK8sEvent,
   }, forceNamespaceFilter, showPolicyEffect)
-  const [reconnect, isReconnecting] = useRefreshAnimation(reconnectSSE)
+  const clusterConnected = connection.state === 'connected'
 
   // On large clusters (where the server requires namespace filtering), keep
   // SSE's server-side filter in lockstep with the user's namespace pick.
@@ -1327,7 +1328,6 @@ function AppInner({ manageDocumentTitle = false, documentTitleSuffix }: { manage
   const prevMainView = useRef(mainView)
   useEffect(() => {
     const navigatingToResources = mainView === 'resources' && prevMainView.current !== 'resources'
-    const navigatingToHelm = mainView === 'helm' && prevMainView.current !== 'helm'
     prevMainView.current = mainView
 
     // The URL is the source of truth for what's selected. A deep link
@@ -1342,7 +1342,7 @@ function AppInner({ manageDocumentTitle = false, documentTitleSuffix }: { manage
     if (!navigatingToResources && !params.has('resource')) {
       setSelectedResource(null)
     }
-    if (!navigatingToHelm && !params.has('release')) {
+    if (!params.has('release')) {
       setSelectedHelmRelease(null)
     }
   }, [mainView])
@@ -1458,6 +1458,8 @@ function AppInner({ manageDocumentTitle = false, documentTitleSuffix }: { manage
     setVisibleKinds(new Set())
   }, [])
 
+  const navActiveView = mainView === 'helmCompare' ? 'helm' : mainView
+
   return (
     <PortForwardProvider>
     {/* Preserve the ~800px content floor: the rail is a fixed-width sibling, so
@@ -1470,7 +1472,7 @@ function AppInner({ manageDocumentTitle = false, documentTitleSuffix }: { manage
     >
       {showNavRail && (
         <PrimaryNavRail
-          activeView={mainView}
+          activeView={navActiveView}
           onNavigate={setMainView}
           pinned={navRailEffectivePinned}
           onTogglePinned={toggleNavRailPinned}
@@ -1499,8 +1501,8 @@ function AppInner({ manageDocumentTitle = false, documentTitleSuffix }: { manage
             <div className="flex items-center gap-1.5 ml-1">
               <Tooltip
                 content={
-                  !connected
-                    ? 'Disconnected'
+                  !clusterConnected
+                    ? 'Cluster disconnected'
                     : crdDiscoveryStatus === 'discovering'
                       ? 'Connected — discovering Custom Resources...'
                       : 'Connected'
@@ -1510,7 +1512,7 @@ function AppInner({ manageDocumentTitle = false, documentTitleSuffix }: { manage
               >
                 <span
                   className={`w-2 h-2 rounded-full ${
-                    !connected
+                    !clusterConnected
                       ? 'bg-red-500'
                       : crdDiscoveryStatus === 'discovering'
                         ? 'bg-amber-400 animate-pulse'
@@ -1524,19 +1526,19 @@ function AppInner({ manageDocumentTitle = false, documentTitleSuffix }: { manage
                   "Connected" text here would expand the left section and
                   collide with the absolute-centered nav block at xl, which
                   is the same breakpoint where nav labels appear. */}
-              {(!connected || crdDiscoveryStatus === 'discovering') && (
+              {(!clusterConnected || crdDiscoveryStatus === 'discovering') && (
                 <span className="text-[11px] text-theme-text-tertiary hidden xl:inline">
-                  {!connected ? 'Disconnected' : 'Discovering Custom Resources...'}
+                  {!clusterConnected ? 'Disconnected' : 'Discovering Custom Resources...'}
                 </span>
               )}
-              {!connected && (
+              {!clusterConnected && (
                 <Tooltip content="Reconnect">
                 <button
-                  onClick={reconnect}
-                  disabled={isReconnecting}
+                  onClick={retryConnection}
+                  disabled={isRetrying}
                   className="p-1 text-theme-text-secondary hover:text-theme-text-primary disabled:opacity-50 disabled:pointer-events-none"
                 >
-                  <RefreshCw className={`w-3 h-3 ${isReconnecting ? 'animate-spin' : ''}`} />
+                  <RefreshCw className={`w-3 h-3 ${isRetrying ? 'animate-spin' : ''}`} />
                 </button>
                 </Tooltip>
               )}
@@ -1581,7 +1583,7 @@ function AppInner({ manageDocumentTitle = false, documentTitleSuffix }: { manage
               <button
                 onClick={() => setMainView(view)}
                 className={`flex items-center gap-1 px-2 py-1 text-[13px] rounded-full transition-colors ${
-                  mainView === view
+                  mainView === view || (mainView === 'helmCompare' && view === 'helm')
                     ? 'bg-skyhook-600 dark:bg-skyhook-500 text-white shadow-glow-brand-sm'
                     : 'text-theme-text-secondary hover:text-theme-text-primary hover:bg-theme-hover'
                 }`}
@@ -2019,6 +2021,10 @@ function AppInner({ manageDocumentTitle = false, documentTitleSuffix }: { manage
             selectedRelease={selectedHelmRelease}
             onReleaseClick={navigateToHelmRelease}
           />
+        )}
+
+        {mainView === 'helmCompare' && (
+          <HelmCompareRoute />
         )}
 
         {/* GitOps view (inline only when the host hasn't taken it over — see

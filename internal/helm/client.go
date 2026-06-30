@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -452,38 +453,41 @@ func getReleaseWith(actionConfig *action.Configuration, namespace, name string) 
 	// Extract dependencies
 	dependencies := extractDependencies(rel)
 
-	detail := &HelmReleaseDetail{
-		Name:             rel.Name,
-		Namespace:        rel.Namespace,
-		StorageNamespace: namespace,
-		Chart:            rel.Chart.Metadata.Name,
-		ChartVersion:     rel.Chart.Metadata.Version,
-		AppVersion:       rel.Chart.Metadata.AppVersion,
-		Status:           rel.Info.Status.String(),
-		Revision:         rel.Version,
-		Updated:          rel.Info.LastDeployed.Time,
-		Description:      rel.Info.Description,
-		Notes:            rel.Info.Notes,
-		History:          revisions,
-		Resources:        resources,
-		ResourceHealth:   health,
-		HealthIssue:      issue,
-		HealthSummary:    summary,
-		Hooks:            hooks,
-		HookDiagnostics:  hookDiagnostics,
-		Readme:           readme,
-		Dependencies:     dependencies,
-		LastOperation:    analysis.LastOperation,
-		Operations:       analysis.Operations,
-	}
-	if detail.StorageNamespace == detail.Namespace {
-		detail.StorageNamespace = ""
-	}
 	effectiveStorage := namespace
 	if effectiveStorage == "" {
 		effectiveStorage = rel.Namespace
 	}
-	detail.ManagedByFluxHelmRelease = applyFluxOwnership(rel.Name, effectiveStorage, fluxHelmReleaseMap(context.Background()))
+	managedByFlux := applyFluxOwnership(rel.Name, effectiveStorage, fluxHelmReleaseMap(context.Background()))
+
+	detail := &HelmReleaseDetail{
+		Name:                     rel.Name,
+		Namespace:                rel.Namespace,
+		StorageNamespace:         namespace,
+		Chart:                    rel.Chart.Metadata.Name,
+		ChartVersion:             rel.Chart.Metadata.Version,
+		AppVersion:               rel.Chart.Metadata.AppVersion,
+		Status:                   rel.Info.Status.String(),
+		Revision:                 rel.Version,
+		Updated:                  rel.Info.LastDeployed.Time,
+		Description:              rel.Info.Description,
+		Notes:                    rel.Info.Notes,
+		History:                  revisions,
+		Resources:                resources,
+		ResourceHealth:           health,
+		HealthIssue:              issue,
+		HealthSummary:            summary,
+		Hooks:                    hooks,
+		HookDiagnostics:          hookDiagnostics,
+		Readme:                   readme,
+		Dependencies:             dependencies,
+		LastOperation:            analysis.LastOperation,
+		Operations:               analysis.Operations,
+		ManagedByFluxHelmRelease: managedByFlux,
+	}
+	detail.OperationInsight = buildOperationInsight(detail)
+	if detail.StorageNamespace == detail.Namespace {
+		detail.StorageNamespace = ""
+	}
 
 	return detail, nil
 }
@@ -671,6 +675,43 @@ func releaseNotes(rel *release.Release) string {
 	return rel.Info.Notes
 }
 
+// GetHooksDiff returns a hook metadata diff between two revisions.
+func (c *Client) GetHooksDiff(namespace, name string, revision1, revision2 int) (*HooksDiff, error) {
+	return c.getHooksDiff(namespace, name, revision1, revision2, "", nil)
+}
+
+// GetHooksDiffAsUser is GetHooksDiff with K8s impersonation.
+func (c *Client) GetHooksDiffAsUser(namespace, name string, revision1, revision2 int, username string, groups []string) (*HooksDiff, error) {
+	return c.getHooksDiff(namespace, name, revision1, revision2, username, groups)
+}
+
+func (c *Client) getHooksDiff(namespace, name string, revision1, revision2 int, username string, groups []string) (*HooksDiff, error) {
+	rel1, err := c.getReleaseRevisionAsUser(namespace, name, revision1, username, groups)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get release revision %d: %w", revision1, err)
+	}
+	rel2, err := c.getReleaseRevisionAsUser(namespace, name, revision2, username, groups)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get release revision %d: %w", revision2, err)
+	}
+	removed, added, modified, unchanged := diffHooks(extractHooks(rel1), extractHooks(rel2))
+	return &HooksDiff{
+		Revision1: revision1,
+		Revision2: revision2,
+		Added:     nonNilHelmHooks(added),
+		Removed:   nonNilHelmHooks(removed),
+		Modified:  nonNilHelmHooks(modified),
+		Unchanged: nonNilHelmHooks(unchanged),
+	}, nil
+}
+
+func nonNilHelmHooks(hooks []HelmHook) []HelmHook {
+	if hooks == nil {
+		return []HelmHook{}
+	}
+	return hooks
+}
+
 // GetResourceDiff returns added/removed rendered resources between two revisions.
 func (c *Client) GetResourceDiff(namespace, name string, revision1, revision2 int) (*ResourceDiff, error) {
 	return c.getResourceDiff(namespace, name, revision1, revision2, "", nil)
@@ -690,16 +731,18 @@ func (c *Client) getResourceDiff(namespace, name string, revision1, revision2 in
 	if err != nil {
 		return nil, fmt.Errorf("failed to get release revision %d: %w", revision2, err)
 	}
-	removed, added, unchanged := diffResourceRefs(
-		resourceRefs(parseManifestResources(rel1.Manifest, rel1.Namespace)),
-		resourceRefs(parseManifestResources(rel2.Manifest, rel2.Namespace)),
-	)
+	leftResources, leftParseErrors := parseManifestResourceObjects(rel1.Manifest, rel1.Namespace)
+	rightResources, rightParseErrors := parseManifestResourceObjects(rel2.Manifest, rel2.Namespace)
+	removed, added, common := diffResourceRefs(resourceRefsFromRendered(leftResources), resourceRefsFromRendered(rightResources))
+	modified, unchanged := diffRenderedResourceObjects(common, leftResources, rightResources)
 	return &ResourceDiff{
-		Revision1: revision1,
-		Revision2: revision2,
-		Added:     nonNilResourceRefs(added),
-		Removed:   nonNilResourceRefs(removed),
-		Unchanged: nonNilResourceRefs(unchanged),
+		Revision1:       revision1,
+		Revision2:       revision2,
+		Added:           nonNilResourceRefs(added),
+		Removed:         nonNilResourceRefs(removed),
+		Modified:        nonNilResourceChanges(modified),
+		Unchanged:       nonNilResourceRefs(unchanged),
+		ParseErrorCount: leftParseErrors + rightParseErrors,
 	}, nil
 }
 
@@ -708,6 +751,13 @@ func nonNilResourceRefs(refs []ResourceRef) []ResourceRef {
 		return []ResourceRef{}
 	}
 	return refs
+}
+
+func nonNilResourceChanges(changes []ResourceChange) []ResourceChange {
+	if changes == nil {
+		return []ResourceChange{}
+	}
+	return changes
 }
 
 func (c *Client) getReleaseRevisionAsUser(namespace, name string, revision int, username string, groups []string) (*release.Release, error) {
@@ -779,6 +829,15 @@ func resourceRefs(resources []OwnedResource) []ResourceRef {
 	return refs
 }
 
+func resourceRefsFromRendered(resources []renderedResource) []ResourceRef {
+	refs := make([]ResourceRef, 0, len(resources))
+	for _, r := range resources {
+		refs = append(refs, r.Ref)
+	}
+	sortResourceRefs(refs)
+	return refs
+}
+
 func diffResourceRefs(left, right []ResourceRef) (removed, added, unchanged []ResourceRef) {
 	leftMap := make(map[string]ResourceRef, len(left))
 	rightMap := make(map[string]ResourceRef, len(right))
@@ -807,6 +866,80 @@ func diffResourceRefs(left, right []ResourceRef) (removed, added, unchanged []Re
 	return removed, added, unchanged
 }
 
+func diffHooks(left, right []HelmHook) (removed, added, modified, unchanged []HelmHook) {
+	leftMap := make(map[string]HelmHook, len(left))
+	rightMap := make(map[string]HelmHook, len(right))
+	for _, hook := range left {
+		leftMap[helmHookKey(hook)] = hook
+	}
+	for _, hook := range right {
+		rightMap[helmHookKey(hook)] = hook
+	}
+	for key, hook := range leftMap {
+		next, ok := rightMap[key]
+		if !ok {
+			removed = append(removed, hook)
+			continue
+		}
+		if helmHookSignature(hook) == helmHookSignature(next) {
+			unchanged = append(unchanged, next)
+			continue
+		}
+		next.ManifestChanged = hook.ManifestDigest != next.ManifestDigest
+		modified = append(modified, next)
+	}
+	for key, hook := range rightMap {
+		if _, ok := leftMap[key]; ok {
+			continue
+		}
+		added = append(added, hook)
+	}
+	sortHelmHooks(removed)
+	sortHelmHooks(added)
+	sortHelmHooks(modified)
+	sortHelmHooks(unchanged)
+	return removed, added, modified, unchanged
+}
+
+func sortHelmHooks(hooks []HelmHook) {
+	sort.Slice(hooks, func(i, j int) bool {
+		return helmHookKey(hooks[i]) < helmHookKey(hooks[j])
+	})
+}
+
+func helmHookKey(hook HelmHook) string {
+	return hook.Namespace + "/" + hook.Kind + "/" + hook.Name
+}
+
+func helmHookSignature(hook HelmHook) string {
+	stable := struct {
+		Path              string
+		ManifestDigest    string
+		Events            []string
+		Weight            int
+		DeletePolicies    []string
+		OutputLogPolicies []string
+	}{
+		Path:              hook.Path,
+		ManifestDigest:    hook.ManifestDigest,
+		Events:            sortedStrings(hook.Events),
+		Weight:            hook.Weight,
+		DeletePolicies:    sortedStrings(hook.DeletePolicies),
+		OutputLogPolicies: sortedStrings(hook.OutputLogPolicies),
+	}
+	b, err := json.Marshal(stable)
+	if err != nil {
+		return fmt.Sprintf("%#v", stable)
+	}
+	return string(b)
+}
+
+func sortedStrings(values []string) []string {
+	out := append([]string(nil), values...)
+	sort.Strings(out)
+	return out
+}
+
 func sortResourceRefs(refs []ResourceRef) {
 	sort.Slice(refs, func(i, j int) bool {
 		return resourceRefKey(refs[i]) < resourceRefKey(refs[j])
@@ -815,6 +948,75 @@ func sortResourceRefs(refs []ResourceRef) {
 
 func resourceRefKey(ref ResourceRef) string {
 	return ref.APIVersion + "/" + ref.Kind + "/" + ref.Namespace + "/" + ref.Name
+}
+
+func diffRenderedResourceObjects(common []ResourceRef, leftResources, rightResources []renderedResource) (modified []ResourceChange, unchanged []ResourceRef) {
+	leftMap := renderedResourceMap(leftResources)
+	rightMap := renderedResourceMap(rightResources)
+	for _, ref := range common {
+		oldResource, oldOK := leftMap[resourceRefKey(ref)]
+		newResource, newOK := rightMap[resourceRefKey(ref)]
+		if !oldOK || !newOK {
+			unchanged = append(unchanged, ref)
+			continue
+		}
+		diff := k8s.ComputeDiffFromUnstructured(
+			ref.Kind,
+			normalizeRenderedResourceForDiff(oldResource.Object),
+			normalizeRenderedResourceForDiff(newResource.Object),
+		)
+		if diff == nil || len(diff.Fields) == 0 {
+			unchanged = append(unchanged, ref)
+			continue
+		}
+		modified = append(modified, ResourceChange{
+			ResourceRef: ref,
+			Summary:     diff.Summary,
+			FieldCount:  len(diff.Fields),
+			Fields:      diff.Fields,
+		})
+	}
+	sortResourceChanges(modified)
+	sortResourceRefs(unchanged)
+	return modified, unchanged
+}
+
+func normalizeRenderedResourceForDiff(in *unstructured.Unstructured) *unstructured.Unstructured {
+	if in == nil {
+		return nil
+	}
+	out := in.DeepCopy()
+	labels := out.GetLabels()
+	if len(labels) == 0 {
+		return out
+	}
+	normalized := make(map[string]string, len(labels))
+	for key, value := range labels {
+		if key == "helm.sh/chart" {
+			continue
+		}
+		normalized[key] = value
+	}
+	if len(normalized) == 0 {
+		unstructured.RemoveNestedField(out.Object, "metadata", "labels")
+		return out
+	}
+	out.SetLabels(normalized)
+	return out
+}
+
+func renderedResourceMap(resources []renderedResource) map[string]renderedResource {
+	out := make(map[string]renderedResource, len(resources))
+	for _, resource := range resources {
+		out[resourceRefKey(resource.Ref)] = resource
+	}
+	return out
+}
+
+func sortResourceChanges(changes []ResourceChange) {
+	sort.Slice(changes, func(i, j int) bool {
+		return resourceRefKey(changes[i].ResourceRef) < resourceRefKey(changes[j].ResourceRef)
+	})
 }
 
 // releaseStorageKey identifies a release independent of where Helm stored the
@@ -1163,45 +1365,71 @@ func toHelmHistoryRevisions(revisions []HelmRevision) []helmhistory.Revision {
 	return out
 }
 
-// parseManifestResources extracts K8s resources from a rendered manifest
-func parseManifestResources(manifest, defaultNamespace string) []OwnedResource {
-	var resources []OwnedResource
+type renderedResource struct {
+	Ref    ResourceRef
+	Object *unstructured.Unstructured
+}
 
-	// Split manifest into individual documents
+func parseManifestResourceObjects(manifest, defaultNamespace string) ([]renderedResource, int) {
+	resources := []renderedResource{}
 	manifests := releaseutil.SplitManifests(manifest)
+	parseErrorCount := 0
 
 	for _, m := range manifests {
-		lines := strings.Split(m, "\n")
-		var kind, apiVersion, name, namespace string
-
-		// Take the first occurrence of each top-level field; nested specs
-		// (e.g. spec.template) can repeat the same keys with different values.
-		for _, line := range lines {
-			line = strings.TrimSpace(line)
-			if after, ok := strings.CutPrefix(line, "kind:"); ok && kind == "" {
-				kind = strings.Trim(strings.TrimSpace(after), `"'`)
-			} else if after, ok := strings.CutPrefix(line, "apiVersion:"); ok && apiVersion == "" {
-				apiVersion = strings.Trim(strings.TrimSpace(after), `"'`)
-			} else if strings.HasPrefix(line, "name:") && name == "" {
-				name = strings.TrimSpace(strings.TrimPrefix(line, "name:"))
-				name = strings.Trim(name, `"'`)
-			} else if strings.HasPrefix(line, "namespace:") && namespace == "" {
-				namespace = strings.TrimSpace(strings.TrimPrefix(line, "namespace:"))
-				namespace = strings.Trim(namespace, `"'`)
-			}
+		m = strings.TrimSpace(m)
+		if m == "" {
+			continue
 		}
-
-		if kind != "" && name != "" {
-			if namespace == "" {
-				namespace = defaultNamespace
-			}
-			resources = append(resources, OwnedResource{
-				Kind:       kind,
-				APIVersion: apiVersion,
-				Name:       name,
-				Namespace:  namespace,
-			})
+		jsonBytes, err := yaml.YAMLToJSON([]byte(m))
+		if err != nil {
+			parseErrorCount++
+			continue
 		}
+		var obj unstructured.Unstructured
+		if err := json.Unmarshal(jsonBytes, &obj.Object); err != nil {
+			parseErrorCount++
+			continue
+		}
+		if obj.GetKind() == "" || obj.GetName() == "" {
+			continue
+		}
+		apiGroup := ""
+		if group, _, ok := strings.Cut(obj.GetAPIVersion(), "/"); ok {
+			apiGroup = group
+		}
+		clusterScoped, _, _ := k8s.ClassifyKindScope(obj.GetKind(), apiGroup)
+		if obj.GetNamespace() == "" && !clusterScoped {
+			obj.SetNamespace(defaultNamespace)
+		}
+		resources = append(resources, renderedResource{
+			Ref: ResourceRef{
+				Kind:       obj.GetKind(),
+				APIVersion: obj.GetAPIVersion(),
+				Name:       obj.GetName(),
+				Namespace:  obj.GetNamespace(),
+			},
+			Object: &obj,
+		})
+	}
+
+	sort.Slice(resources, func(i, j int) bool {
+		return resourceRefKey(resources[i].Ref) < resourceRefKey(resources[j].Ref)
+	})
+
+	return resources, parseErrorCount
+}
+
+// parseManifestResources extracts K8s resources from a rendered manifest
+func parseManifestResources(manifest, defaultNamespace string) []OwnedResource {
+	rendered, _ := parseManifestResourceObjects(manifest, defaultNamespace)
+	resources := make([]OwnedResource, 0, len(rendered))
+	for _, resource := range rendered {
+		resources = append(resources, OwnedResource{
+			Kind:       resource.Ref.Kind,
+			APIVersion: resource.Ref.APIVersion,
+			Name:       resource.Ref.Name,
+			Namespace:  resource.Ref.Namespace,
+		})
 	}
 
 	// Sort by kind, then name
@@ -1418,6 +1646,7 @@ func extractHooks(rel *release.Release) []HelmHook {
 			Namespace:         namespace,
 			Kind:              h.Kind,
 			Path:              h.Path,
+			ManifestDigest:    manifestDigest(h.Manifest),
 			Events:            events,
 			Weight:            h.Weight,
 			DeletePolicies:    deletePolicies,
@@ -1441,6 +1670,15 @@ func extractHooks(rel *release.Release) []HelmHook {
 	}
 
 	return hooks
+}
+
+func manifestDigest(manifest string) string {
+	trimmed := strings.TrimSpace(manifest)
+	if trimmed == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(trimmed))
+	return fmt.Sprintf("%x", sum)
 }
 
 func extractHookDiagnostics(hooks []HelmHook) []HookDiagnostic {

@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/skyhook-io/radar/pkg/helmhistory"
+	"github.com/skyhook-io/radar/pkg/k8score"
 )
 
 type HelmOperation = helmhistory.Operation
@@ -50,28 +51,43 @@ type HelmReleaseDetail struct {
 	Name      string `json:"name"`
 	Namespace string `json:"namespace"`
 	// Empty means Helm stores release metadata in Namespace.
-	StorageNamespace string            `json:"storageNamespace,omitempty"`
-	Chart            string            `json:"chart"`
-	ChartVersion     string            `json:"chartVersion"`
-	AppVersion       string            `json:"appVersion"`
-	Status           string            `json:"status"`
-	Revision         int               `json:"revision"`
-	Updated          time.Time         `json:"updated"`
-	Description      string            `json:"description"`
-	Notes            string            `json:"notes"`
-	History          []HelmRevision    `json:"history"`
-	Resources        []OwnedResource   `json:"resources"`
-	ResourceHealth   string            `json:"resourceHealth,omitempty"`
-	HealthIssue      string            `json:"healthIssue,omitempty"`
-	HealthSummary    string            `json:"healthSummary,omitempty"`
-	Hooks            []HelmHook        `json:"hooks,omitempty"`
-	HookDiagnostics  []HookDiagnostic  `json:"hookDiagnostics,omitempty"`
-	Readme           string            `json:"readme,omitempty"`
-	Dependencies     []ChartDependency `json:"dependencies,omitempty"`
-	LastOperation    *HelmOperation    `json:"lastOperation,omitempty"`
-	Operations       []HelmOperation   `json:"operations,omitempty"`
+	StorageNamespace string                `json:"storageNamespace,omitempty"`
+	Chart            string                `json:"chart"`
+	ChartVersion     string                `json:"chartVersion"`
+	AppVersion       string                `json:"appVersion"`
+	Status           string                `json:"status"`
+	Revision         int                   `json:"revision"`
+	Updated          time.Time             `json:"updated"`
+	Description      string                `json:"description"`
+	Notes            string                `json:"notes"`
+	History          []HelmRevision        `json:"history"`
+	Resources        []OwnedResource       `json:"resources"`
+	ResourceHealth   string                `json:"resourceHealth,omitempty"`
+	HealthIssue      string                `json:"healthIssue,omitempty"`
+	HealthSummary    string                `json:"healthSummary,omitempty"`
+	Hooks            []HelmHook            `json:"hooks,omitempty"`
+	HookDiagnostics  []HookDiagnostic      `json:"hookDiagnostics,omitempty"`
+	Readme           string                `json:"readme,omitempty"`
+	Dependencies     []ChartDependency     `json:"dependencies,omitempty"`
+	LastOperation    *HelmOperation        `json:"lastOperation,omitempty"`
+	Operations       []HelmOperation       `json:"operations,omitempty"`
+	OperationInsight *HelmOperationInsight `json:"operationInsight,omitempty"`
 	// See HelmRelease.ManagedByFluxHelmRelease.
 	ManagedByFluxHelmRelease string `json:"managedByFluxHelmRelease,omitempty"`
+}
+
+type HelmOperationInsight struct {
+	State            string                `json:"state"`
+	PrimaryResource  *OwnedResource        `json:"primaryResource,omitempty"`
+	RelatedResources []OwnedResource       `json:"relatedResources,omitempty"`
+	SignalCount      int                   `json:"signalCount,omitempty"`
+	SuggestedCompare *HelmSuggestedCompare `json:"suggestedCompare,omitempty"`
+}
+
+type HelmSuggestedCompare struct {
+	Revision1 int    `json:"revision1"`
+	Revision2 int    `json:"revision2"`
+	Reason    string `json:"reason,omitempty"`
 }
 
 // HelmHook represents a Helm hook (pre/post install, upgrade, etc.)
@@ -80,6 +96,8 @@ type HelmHook struct {
 	Namespace         string     `json:"namespace,omitempty"`
 	Kind              string     `json:"kind"`
 	Path              string     `json:"path,omitempty"`
+	ManifestDigest    string     `json:"-"`
+	ManifestChanged   bool       `json:"manifestChanged,omitempty"`
 	Events            []string   `json:"events"`
 	Weight            int        `json:"weight"`
 	Status            string     `json:"status,omitempty"`
@@ -203,6 +221,16 @@ type NotesDiff struct {
 	Diff      string `json:"diff"`
 }
 
+// HooksDiff represents hook metadata changes between two revisions.
+type HooksDiff struct {
+	Revision1 int        `json:"revision1"`
+	Revision2 int        `json:"revision2"`
+	Added     []HelmHook `json:"added"`
+	Removed   []HelmHook `json:"removed"`
+	Modified  []HelmHook `json:"modified"`
+	Unchanged []HelmHook `json:"unchanged"`
+}
+
 // ResourceRef identifies a rendered resource in a Helm revision.
 type ResourceRef struct {
 	Kind       string `json:"kind"`
@@ -211,13 +239,24 @@ type ResourceRef struct {
 	Namespace  string `json:"namespace"`
 }
 
-// ResourceDiff represents added/removed resource identities between revisions.
+// ResourceChange describes a rendered resource that exists in both revisions but
+// changed in place.
+type ResourceChange struct {
+	ResourceRef
+	Summary    string                `json:"summary,omitempty"`
+	FieldCount int                   `json:"fieldCount"`
+	Fields     []k8score.FieldChange `json:"fields"`
+}
+
+// ResourceDiff represents rendered resource changes between revisions.
 type ResourceDiff struct {
-	Revision1 int           `json:"revision1"`
-	Revision2 int           `json:"revision2"`
-	Added     []ResourceRef `json:"added"`
-	Removed   []ResourceRef `json:"removed"`
-	Unchanged []ResourceRef `json:"unchanged"`
+	Revision1       int              `json:"revision1"`
+	Revision2       int              `json:"revision2"`
+	Added           []ResourceRef    `json:"added"`
+	Removed         []ResourceRef    `json:"removed"`
+	Modified        []ResourceChange `json:"modified"`
+	Unchanged       []ResourceRef    `json:"unchanged"`
+	ParseErrorCount int              `json:"parseErrorCount,omitempty"`
 }
 
 // UpgradeInfo contains information about available upgrades
