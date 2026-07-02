@@ -414,7 +414,7 @@ export const Omnibar = forwardRef<OmnibarHandle, OmnibarProps>(function Omnibar(
   return (
     <div
       ref={containerRef}
-      className={clsx('relative w-full', hero ? 'max-w-3xl' : 'max-w-xl', open && hero && 'z-[16]')}
+      className={clsx('relative w-full', hero ? 'max-w-3xl' : 'max-w-lg', open && hero && 'z-[16]')}
       // Open on click even when the field is already focused — onFocus alone
       // never fires again, so an autofocused hero (Home) wouldn't reveal the
       // launcher on a click.

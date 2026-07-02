@@ -14,6 +14,8 @@ import { parseContextName, type ParsedContextName } from '../utils/context-name'
 
 interface ContextSwitcherProps {
   className?: string
+  variant?: 'chip' | 'segment'
+  label?: string
 }
 
 export interface ContextSwitcherHandle {
@@ -24,7 +26,7 @@ interface ParsedContext extends ParsedContextName {
   context: ContextInfo
 }
 
-export const ContextSwitcher = forwardRef<ContextSwitcherHandle, ContextSwitcherProps>(({ className = '' }, ref) => {
+export const ContextSwitcher = forwardRef<ContextSwitcherHandle, ContextSwitcherProps>(({ className = '', variant, label }, ref) => {
   const [showConfirm, setShowConfirm] = useState(false)
   const [pendingSwitch, setPendingSwitch] = useState<ParsedContext | null>(null)
   const [sessionCounts, setSessionCounts] = useState<SessionCounts | null>(null)
@@ -191,6 +193,8 @@ export const ContextSwitcher = forwardRef<ContextSwitcherHandle, ContextSwitcher
       <ClusterSwitcher
         ref={ref}
         className={className}
+        variant={variant}
+        label={label}
         currentId={currentId}
         currentName={currentRaw}
         currentSourceLabel={currentSourceLabel}

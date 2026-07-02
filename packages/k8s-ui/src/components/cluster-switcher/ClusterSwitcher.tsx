@@ -58,6 +58,15 @@ export interface ClusterSwitcherProps {
   errorSlot?: ReactNode
   className?: string
   align?: 'left' | 'right'
+  /**
+   * 'chip' (default) renders a self-contained bordered pill. 'segment' renders
+   * a borderless label+value cell for embedding in a shared bordered container
+   * (the unified cluster+namespace scope control) — no border/background/min-w
+   * of its own, with an optional muted {@link label} before the value.
+   */
+  variant?: 'chip' | 'segment'
+  /** Muted label shown before the value in the 'segment' variant (e.g. "Cluster"). */
+  label?: string
 }
 
 // Trigger width cap. With middle-truncation kicking in, this is a
@@ -83,6 +92,8 @@ export const ClusterSwitcher = forwardRef<ClusterSwitcherHandle, ClusterSwitcher
   errorSlot,
   className = '',
   align = 'left',
+  variant = 'chip',
+  label,
 }, ref) => {
   const [isOpen, setIsOpen] = useState(false)
   const [search, setSearch] = useState('')
@@ -195,14 +206,21 @@ export const ClusterSwitcher = forwardRef<ClusterSwitcherHandle, ClusterSwitcher
         type="button"
         onClick={() => setIsOpen(v => !v)}
         disabled={disabled || loading}
-        className={`
-          flex items-center gap-1.5 px-2.5 py-1.5 min-w-[140px]
-          bg-theme-elevated border border-theme-border rounded text-sm font-medium
-          text-theme-text-primary hover:bg-theme-hover hover:border-theme-border-light
-          transition-colors cursor-pointer
-          disabled:opacity-50 disabled:cursor-not-allowed
-        `}
+        className={
+          variant === 'segment'
+            ? `flex items-center gap-1.5 px-3 py-1.5 h-full min-w-[150px] max-w-[264px] text-[13px] font-medium
+               text-theme-text-primary hover:bg-theme-hover transition-colors cursor-pointer
+               disabled:opacity-50 disabled:cursor-not-allowed`
+            : `flex items-center gap-1.5 px-2.5 py-1.5 min-w-[140px]
+               bg-theme-elevated border border-theme-border rounded text-sm font-medium
+               text-theme-text-primary hover:bg-theme-hover hover:border-theme-border-light
+               transition-colors cursor-pointer
+               disabled:opacity-50 disabled:cursor-not-allowed`
+        }
       >
+        {label && (
+          <span className="shrink-0 font-normal text-theme-text-tertiary">{label}</span>
+        )}
         {loading ? (
           <>
             <Loader2 className="w-3.5 h-3.5 animate-spin" />
@@ -220,7 +238,7 @@ export const ClusterSwitcher = forwardRef<ClusterSwitcherHandle, ClusterSwitcher
             <ClusterName
               name={currentName}
               fallbackBadge={<Server className="w-3.5 h-3.5 text-theme-text-secondary" />}
-              className={TRIGGER_NAME_MAX_WIDTH}
+              className={variant === 'segment' ? 'min-w-0 max-w-[214px]' : TRIGGER_NAME_MAX_WIDTH}
               noTooltip={isOpen}
             />
             {currentSourceLabel && (
@@ -240,7 +258,7 @@ export const ClusterSwitcher = forwardRef<ClusterSwitcherHandle, ClusterSwitcher
             )}
           </>
         )}
-        <ChevronDown className={`w-3 h-3 ml-auto transition-transform ${isOpen ? 'rotate-180' : ''}`} />
+        <ChevronDown className={`w-3 h-3 shrink-0 transition-transform ${variant === 'segment' ? '' : 'ml-auto'} ${isOpen ? 'rotate-180' : ''}`} />
       </button>
 
       {isOpen && (

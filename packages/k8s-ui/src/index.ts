@@ -53,6 +53,14 @@ export * from './components/issues'
 // Cluster switcher (shared trigger+dropdown for OSS Radar and Radar Hub)
 export * from './components/cluster-switcher'
 
+// Namespace picker (shared scope-filter trigger+dropdown for OSS Radar and
+// Radar Hub — pure presentation, data injected via props)
+export * from './components/namespace-switcher'
+
+// Scope pill — the shared bordered shell that groups the cluster + namespace
+// segments into one unit (OSS header + Radar Hub cluster top bar)
+export * from './components/scope-pill'
+
 // Applications (shared host-agnostic list + detail shell for the deployable-
 // software surface; OSS renders single-cluster, Cloud adds the fleet layer)
 export * from './components/applications'

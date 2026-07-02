@@ -6,9 +6,9 @@ import { useQueryClient } from '@tanstack/react-query'
 import { useNavigate, useLocation, useSearchParams, useNavigationType, NavigationType } from 'react-router-dom'
 import { HomeView } from './components/home/HomeView'
 import { DebugOverlay } from './components/DebugOverlay'
-import { TopologyGraph, TopologySearch, TopologyFilterSidebar, TopologyControls, FreshnessControl, gitOpsRouteForKind, gitOpsRouteForResource } from '@skyhook-io/k8s-ui'
+import { TopologyGraph, TopologySearch, TopologyFilterSidebar, TopologyControls, FreshnessControl, gitOpsRouteForKind, gitOpsRouteForResource, ScopePill } from '@skyhook-io/k8s-ui'
 import { initNavigationMap } from '@skyhook-io/k8s-ui/utils/navigation'
-import { useAPIResources } from './api/apiResources'
+import { useAPIResources, CORE_RESOURCES } from './api/apiResources'
 import { TimelineView } from './components/timeline/TimelineView'
 import { ResourcesView } from './components/resources/ResourcesView'
 import { serializeColumnFilters } from './components/resources/resource-utils'
@@ -52,7 +52,7 @@ import { KeyboardShortcutProvider, useRegisterShortcut, useRegisterShortcuts, us
 import { useAnimatedUnmount } from './hooks/useAnimatedUnmount'
 import { useDocumentTitle } from './hooks/useDocumentTitle'
 import radarLoadingIcon from '@skyhook-io/k8s-ui/assets/radar/radar-icon-loading.svg'
-import { RefreshCw, Network, List, Clock, Package, Sun, Moon, Activity, Home, Star, Search, Bug, SquareTerminal, ShieldCheck, GitBranch, HelpCircle } from 'lucide-react'
+import { Network, List, Clock, Package, Sun, Moon, Activity, Home, Star, Search, Bug, SquareTerminal, ShieldCheck, GitBranch, HelpCircle } from 'lucide-react'
 import { useTheme } from './context/ThemeContext'
 import { Tooltip } from './components/ui/Tooltip'
 import { LargeClusterNamespacePicker } from './components/shared/LargeClusterNamespacePicker'
@@ -125,6 +125,48 @@ function getViewFromPath(pathname: string): ExtendedMainView {
   if (path === 'compare') return 'compare'
   if (path === 'issues') return 'issues'
   return 'home'
+}
+
+// The namespace scope filter is meaningful only on namespaced surfaces. On
+// cluster-scoped views it does nothing, so we disable it with an explanation
+// rather than leaving a dead control that silently ignores the pick:
+//   - Cost is reported per-namespace across the whole cluster (the view IS the
+//     breakdown; a filter would only hide rows).
+//   - A GitOps detail tree spans namespaces — its controller lives in one
+//     namespace but manages workloads across many.
+//   - A cluster-scoped resource kind (Nodes, PVs, ClusterRoles…) has no
+//     namespace at all.
+// The pick itself is preserved so it re-applies when the user returns to a
+// namespaced view.
+function namespaceFilterDisabled(
+  view: ExtendedMainView,
+  pathname: string,
+  apiResources?: { name: string; kind: string; namespaced: boolean }[],
+): { disabled: boolean; tooltip?: string } {
+  if (view === 'cost') {
+    return {
+      disabled: true,
+      tooltip: 'Cost is reported per namespace across the whole cluster — the namespace filter doesn’t apply here.',
+    }
+  }
+  const segments = pathname.replace(/^\//, '').split('/')
+  if (view === 'gitops' && segments[1] === 'detail') {
+    return {
+      disabled: true,
+      tooltip: 'This resource manages workloads across namespaces — the namespace filter doesn’t apply to its tree.',
+    }
+  }
+  if (view === 'resources') {
+    const kindSlug = segments[1]
+    const match = kindSlug ? apiResources?.find(r => r.name === kindSlug) : undefined
+    if (match && !match.namespaced) {
+      return {
+        disabled: true,
+        tooltip: `${match.kind} is a cluster-scoped resource — namespaces don’t apply.`,
+      }
+    }
+  }
+  return { disabled: false }
 }
 
 // Browser tab label for every Radar view, derived from the route URL so it's
@@ -337,6 +379,13 @@ function AppInner({ manageDocumentTitle = false, documentTitleSuffix }: { manage
   // resources view has run initNavigationMap().
   const { data: navApiResources } = useAPIResources()
   useEffect(() => { if (navApiResources) initNavigationMap(navApiResources) }, [navApiResources])
+
+  // View-aware namespace scope: disabled on cluster-scoped surfaces so the
+  // chip isn't a dead control next to the cluster switcher.
+  // Fall back to the static core-resource list before discovery loads, so the
+  // chip disables immediately on a cluster-scoped core kind (Nodes, PVs, …)
+  // instead of flickering enabled until /api-resources resolves.
+  const namespaceFilter = namespaceFilterDisabled(mainView, location.pathname, navApiResources ?? CORE_RESOURCES)
 
   // One URL-derived tab title for every view (see radarPageTitle). Driving it
   // from the URL — not the mounted component. Off unless the host opts in
@@ -1489,20 +1538,58 @@ function AppInner({ manageDocumentTitle = false, documentTitleSuffix }: { manage
       {/* Header — suppressed in chromeless embed; the host owns the chrome. */}
       {!chromeless && (
       <header className="relative z-50 flex items-center justify-between px-4 py-2 bg-theme-base/90 backdrop-blur-sm border-b border-theme-border/50">
-        {/* Left: Logo + Cluster info */}
-        <div className="flex items-center gap-4 shrink-0">
+        {/* Left: Logo + Cluster info. In the standalone (nav-rail) layout this
+            is a FIXED-WIDTH column so the omnibar after it is force-pinned: the
+            scope pill + status dot can change width (cluster/namespace value)
+            without ever shifting the search box. The pill's own name/value caps
+            keep it inside this width; the embedded/pill layout keeps auto width
+            (its center bar is absolutely positioned). */}
+        <div className={`flex items-center gap-4 shrink-0 ${showNavRail ? 'w-[492px]' : ''}`}>
           {/* Standalone rail owns the brand; only the embedded/pill layout
               shows it in the header (host may override via brandSlot). */}
           {navCustomization.brandSlot ?? (showNavRail ? null : <Logo />)}
 
-          <div className="flex items-center gap-2">
-            {navCustomization.contextSlot ?? <ContextSwitcher ref={contextSwitcherRef} />}
-            {/* Connection status - next to cluster name */}
-            <div className="flex items-center gap-1.5 ml-1">
+          <div className={`flex items-center gap-2 min-w-0 ${showNavRail ? 'flex-1' : ''}`}>
+            {navCustomization.contextSlot ? (
+              // Embedded host supplies its own cluster switcher — keep the two
+              // controls separate (the host owns the cluster chip's styling).
+              <>
+                {navCustomization.contextSlot}
+                <NamespaceSwitcher
+                  ref={namespaceSwitcherRef}
+                  disabled={namespaceFilter.disabled}
+                  disabledTooltip={namespaceFilter.tooltip}
+                />
+              </>
+            ) : (
+              // Standalone: cluster + namespace as one "scope" pill — two
+              // borderless segments split by a divider, reading as a single
+              // "what am I looking at" unit. The shared ScopePill shell is the
+              // same one Radar Hub's cluster top bar uses, so the two match.
+              <ScopePill>
+                <ContextSwitcher ref={contextSwitcherRef} variant="segment" />
+                <NamespaceSwitcher
+                  ref={namespaceSwitcherRef}
+                  variant="segment"
+                  disabled={namespaceFilter.disabled}
+                  disabledTooltip={namespaceFilter.tooltip}
+                />
+              </ScopePill>
+            )}
+            {/* Connection status — a fixed-size dot (state in the tooltip; the
+                dot is the reconnect control when disconnected) plus, when the
+                header is wide enough (xl+), a label. The label is nowrap and
+                unbounded: it overflows the fixed left column into the empty gap
+                before the centered search box rather than shifting anything (the
+                dot + pill are shrink-0, so layout stays put — the search box
+                never moves). Where the gap is smaller than the label, its tail
+                tucks under the omnibar's solid background. Below xl it's the dot
+                alone. */}
+            <div className="ml-1 flex items-center gap-1.5 shrink-0">
               <Tooltip
                 content={
                   !clusterConnected
-                    ? 'Cluster disconnected'
+                    ? 'Cluster disconnected — click to reconnect'
                     : crdDiscoveryStatus === 'discovering'
                       ? 'Connected — discovering Custom Resources...'
                       : 'Connected'
@@ -1510,37 +1597,28 @@ function AppInner({ manageDocumentTitle = false, documentTitleSuffix }: { manage
                 delay={100}
                 position="bottom"
               >
-                <span
-                  className={`w-2 h-2 rounded-full ${
-                    !clusterConnected
-                      ? 'bg-red-500'
-                      : crdDiscoveryStatus === 'discovering'
-                        ? 'bg-amber-400 animate-pulse'
-                        : 'bg-green-500'
-                  }`}
-                />
+                {clusterConnected ? (
+                  <span
+                    className={`block w-2.5 h-2.5 shrink-0 rounded-full ${
+                      crdDiscoveryStatus === 'discovering' ? 'bg-amber-400 animate-pulse' : 'bg-green-500'
+                    }`}
+                  />
+                ) : (
+                  <button
+                    type="button"
+                    onClick={retryConnection}
+                    disabled={isRetrying}
+                    aria-label="Cluster disconnected — reconnect"
+                    className="block shrink-0 disabled:cursor-default"
+                  >
+                    <span className={`block w-2.5 h-2.5 rounded-full bg-red-500 ${isRetrying ? 'animate-pulse' : ''}`} />
+                  </button>
+                )}
               </Tooltip>
-              {/* Inline label only for non-steady states where the user
-                  might need to act or wait. The healthy "Connected" case
-                  is the dot alone; the dot's tooltip discloses it. Keeping
-                  "Connected" text here would expand the left section and
-                  collide with the absolute-centered nav block at xl, which
-                  is the same breakpoint where nav labels appear. */}
-              {(!clusterConnected || crdDiscoveryStatus === 'discovering') && (
-                <span className="text-[11px] text-theme-text-tertiary hidden xl:inline">
-                  {!clusterConnected ? 'Disconnected' : 'Discovering Custom Resources...'}
+              {showNavRail && (!clusterConnected || crdDiscoveryStatus === 'discovering') && (
+                <span className="hidden xl:block whitespace-nowrap text-[11px] text-theme-text-tertiary">
+                  {!clusterConnected ? 'Disconnected' : 'Discovering Custom Resources…'}
                 </span>
-              )}
-              {!clusterConnected && (
-                <Tooltip content="Reconnect">
-                <button
-                  onClick={retryConnection}
-                  disabled={isRetrying}
-                  className="p-1 text-theme-text-secondary hover:text-theme-text-primary disabled:opacity-50 disabled:pointer-events-none"
-                >
-                  <RefreshCw className={`w-3 h-3 ${isRetrying ? 'animate-spin' : ''}`} />
-                </button>
-                </Tooltip>
               )}
             </div>
             {/* Port forwards indicator — shown only when sessions exist */}
@@ -1607,7 +1685,12 @@ function AppInner({ manageDocumentTitle = false, documentTitleSuffix }: { manage
         )}
 
         {/* Center: omnibar — standalone search + command surface (the ⌘K entry).
-            Fills the space the pill bar left; embedded keeps the pills + modal. */}
+            Its container is one of three EQUAL flex-1 columns (see the left/right
+            groups): equal side columns keep this middle column — and the search
+            box centered in it — pinned regardless of how wide the left-side
+            chrome gets (cluster name, namespace label, "Discovering…" /
+            "Disconnected" text). Overflowing side content truncates instead of
+            dragging the box. Same pattern as Radar Hub's ClusterTopBar. */}
         {showNavRail && (
           <div className="hidden sm:flex flex-1 justify-center min-w-0 px-3">
             <RadarOmnibar
@@ -1633,11 +1716,6 @@ function AppInner({ manageDocumentTitle = false, documentTitleSuffix }: { manage
 
         {/* Right: Controls */}
         <div className="flex items-center gap-3 shrink-0">
-          <NamespaceSwitcher
-            ref={namespaceSwitcherRef}
-          />
-
-
           {/* Command palette trigger — embedded only; standalone has the
               top-center omnibar (which is the ⌘K surface). */}
           {!showNavRail && (
