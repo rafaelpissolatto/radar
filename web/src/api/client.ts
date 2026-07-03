@@ -103,6 +103,47 @@ export function isForbiddenError(error: unknown): boolean {
   return error instanceof ApiError && error.status === 403
 }
 
+const METRICS_API_GROUP_TOKENS = ['metrics', 'k8s', 'io'] as const
+
+function mentionsMetricsAPIGroup(message: string): boolean {
+  const tokens = message.split(/[^a-z0-9]+/).filter(Boolean)
+  return tokens.some((token, index) => (
+    token === METRICS_API_GROUP_TOKENS[0] &&
+    tokens[index + 1] === METRICS_API_GROUP_TOKENS[1] &&
+    tokens[index + 2] === METRICS_API_GROUP_TOKENS[2]
+  ))
+}
+
+function hasMetricsUnavailablePhrase(message: string): boolean {
+  return (
+    message.includes('may not be installed') ||
+    message.includes('not found') ||
+    message.includes('could not find the requested resource') ||
+    message.includes('no matches for kind') ||
+    message.includes('no resource matches') ||
+    message.includes('no metrics known') ||
+    message.includes('not available') ||
+    message.includes('unable to fetch metrics') ||
+    message.includes('currently unable to handle the request')
+  )
+}
+
+export function isMetricsUnavailableError(error: unknown): boolean {
+  if (!(error instanceof ApiError)) return false
+  if (error.status !== 404 && error.status !== 500) return false
+  return [error.message, error.data?.error].some((message) => {
+    if (typeof message !== 'string') return false
+    const normalized = message.toLowerCase()
+    const hasMetricsSignal = (
+      normalized.includes('metrics-server') ||
+      mentionsMetricsAPIGroup(normalized) ||
+      normalized.includes('pod metrics') ||
+      normalized.includes('node metrics')
+    )
+    return hasMetricsSignal && hasMetricsUnavailablePhrase(normalized)
+  })
+}
+
 export async function fetchJSON<T>(path: string, signal?: AbortSignal): Promise<T> {
   const response = await apiFetch(`${getApiBase()}${path}`, signal ? { signal } : undefined)
   if (!response.ok) {
@@ -1253,25 +1294,44 @@ export interface NodeMetrics {
   }
 }
 
+async function fetchMetricsOrNull<T>(path: string): Promise<T | null> {
+  try {
+    return await fetchJSON<T>(path)
+  } catch (error) {
+    if (isMetricsUnavailableError(error)) return null
+    throw error
+  }
+}
+
+function retryMetricsQuery(failureCount: number, error: unknown): boolean {
+  return !isMetricsUnavailableError(error) && failureCount < 1
+}
+
 // Fetch metrics for a specific pod
-export function usePodMetrics(namespace: string, podName: string) {
-  return useQuery<PodMetrics>({
+export function usePodMetrics(namespace: string, podName: string, options?: { enabled?: boolean }) {
+  return useQuery<PodMetrics | null>({
     queryKey: ['pod-metrics', namespace, podName],
-    queryFn: () => fetchJSON(`/metrics/pods/${namespace}/${podName}`),
-    enabled: Boolean(namespace && podName),
-    staleTime: 15000, // Metrics are fresh for 15 seconds
-    refetchInterval: 30000, // Refresh every 30 seconds
+    queryFn: () => fetchMetricsOrNull<PodMetrics>(`/metrics/pods/${namespace}/${podName}`),
+    enabled: Boolean(namespace && podName) && (options?.enabled ?? true),
+    staleTime: 15000,
+    refetchInterval: 30000,
+    refetchOnMount: 'always',
+    refetchOnReconnect: 'always',
+    retry: retryMetricsQuery,
   })
 }
 
 // Fetch metrics for a specific node
-export function useNodeMetrics(nodeName: string) {
-  return useQuery<NodeMetrics>({
+export function useNodeMetrics(nodeName: string, options?: { enabled?: boolean }) {
+  return useQuery<NodeMetrics | null>({
     queryKey: ['node-metrics', nodeName],
-    queryFn: () => fetchJSON(`/metrics/nodes/${nodeName}`),
-    enabled: Boolean(nodeName),
+    queryFn: () => fetchMetricsOrNull<NodeMetrics>(`/metrics/nodes/${nodeName}`),
+    enabled: Boolean(nodeName) && (options?.enabled ?? true),
     staleTime: 15000,
     refetchInterval: 30000,
+    refetchOnMount: 'always',
+    refetchOnReconnect: 'always',
+    retry: retryMetricsQuery,
   })
 }
 
@@ -1295,19 +1355,57 @@ export interface PodMetricsHistory {
   name: string
   containers: ContainerMetricsHistory[]
   collectionError?: string
+  rawCollectionError?: string
+  metricsUnavailableDiagnosis?: string
+  metricsUnavailable?: boolean
+  metricsUnavailableReason?: string
 }
 
 export interface NodeMetricsHistory {
   name: string
   dataPoints: MetricsDataPoint[]
   collectionError?: string
+  rawCollectionError?: string
+  metricsUnavailableDiagnosis?: string
+  metricsUnavailable?: boolean
+  metricsUnavailableReason?: string
+}
+
+function withoutCollectionError<T extends { collectionError?: string; rawCollectionError?: string }>(history: T): T {
+  const next = { ...history }
+  delete next.collectionError
+  delete next.rawCollectionError
+  return next
+}
+
+export function normalizePodMetricsHistory(history: PodMetricsHistory): PodMetricsHistory {
+  if (history.metricsUnavailable !== true) return history
+  return { ...withoutCollectionError(history), metricsUnavailable: true, metricsUnavailableReason: history.rawCollectionError || history.collectionError }
+}
+
+export function normalizeNodeMetricsHistory(history: NodeMetricsHistory): NodeMetricsHistory {
+  if (history.metricsUnavailable !== true) return history
+  return { ...withoutCollectionError(history), metricsUnavailable: true, metricsUnavailableReason: history.rawCollectionError || history.collectionError }
+}
+
+export function shouldFetchLiveMetrics(historySettled: boolean, metricsUnavailable: boolean): boolean {
+  return historySettled && !metricsUnavailable
+}
+
+export function isLiveMetricsUnavailable(liveMetricsEnabled: boolean, metrics: unknown): boolean {
+  return liveMetricsEnabled && metrics === null
+}
+
+export function getVisibleLiveMetrics<T>(liveMetricsEnabled: boolean, metricsUnavailable: boolean, metrics: T | null | undefined): T | undefined {
+  if (!liveMetricsEnabled || metricsUnavailable) return undefined
+  return metrics ?? undefined
 }
 
 // Fetch historical metrics for a pod (last ~1 hour)
 export function usePodMetricsHistory(namespace: string, podName: string) {
   return useQuery<PodMetricsHistory>({
     queryKey: ['pod-metrics-history', namespace, podName],
-    queryFn: () => fetchJSON(`/metrics/pods/${namespace}/${podName}/history`),
+    queryFn: async () => normalizePodMetricsHistory(await fetchJSON<PodMetricsHistory>(`/metrics/pods/${namespace}/${podName}/history`)),
     enabled: Boolean(namespace && podName),
     staleTime: 25000, // Slightly less than poll interval
     refetchInterval: 30000, // Match the backend poll interval
@@ -1318,7 +1416,7 @@ export function usePodMetricsHistory(namespace: string, podName: string) {
 export function useNodeMetricsHistory(nodeName: string) {
   return useQuery<NodeMetricsHistory>({
     queryKey: ['node-metrics-history', nodeName],
-    queryFn: () => fetchJSON(`/metrics/nodes/${nodeName}/history`),
+    queryFn: async () => normalizeNodeMetricsHistory(await fetchJSON<NodeMetricsHistory>(`/metrics/nodes/${nodeName}/history`)),
     enabled: Boolean(nodeName),
     staleTime: 25000,
     refetchInterval: 30000,
@@ -1555,9 +1653,12 @@ export function useAutoPromConnect(): void {
     const timeout = window.setTimeout(() => {
       // Direct apiFetch (not via the usePrometheusConnect mutation) so the
       // meta-driven toast handler stays silent — the user didn't click anything.
-      apiFetch(`${getApiBase()}/prometheus/connect`, { method: 'POST' })
-        .then(resp => {
+      apiFetch(`${getApiBase()}/prometheus/connect?optional=true`, { method: 'POST' })
+        .then(async resp => {
           if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+          const nextStatus = await resp.json() as PrometheusStatus
+          queryClient.setQueryData(['prometheus-status'], nextStatus)
+          if (!nextStatus.connected) throw new Error(nextStatus.error || 'Prometheus unavailable')
           queryClient.invalidateQueries({ queryKey: ['prometheus-status'] })
         })
         .catch(() => {

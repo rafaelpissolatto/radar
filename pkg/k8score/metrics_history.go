@@ -4,9 +4,11 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/dynamic"
 )
@@ -33,17 +35,23 @@ type ContainerMetricsHistory struct {
 
 // PodMetricsHistory holds historical metrics for a pod.
 type PodMetricsHistory struct {
-	Namespace       string                    `json:"namespace"`
-	Name            string                    `json:"name"`
-	Containers      []ContainerMetricsHistory `json:"containers"`
-	CollectionError string                    `json:"collectionError,omitempty"`
+	Namespace                   string                    `json:"namespace"`
+	Name                        string                    `json:"name"`
+	Containers                  []ContainerMetricsHistory `json:"containers"`
+	CollectionError             string                    `json:"collectionError,omitempty"`
+	RawCollectionError          string                    `json:"rawCollectionError,omitempty"`
+	MetricsUnavailableDiagnosis string                    `json:"metricsUnavailableDiagnosis,omitempty"`
+	MetricsUnavailable          bool                      `json:"metricsUnavailable,omitempty"`
 }
 
 // NodeMetricsHistory holds historical metrics for a node.
 type NodeMetricsHistory struct {
-	Name            string             `json:"name"`
-	DataPoints      []MetricsDataPoint `json:"dataPoints"`
-	CollectionError string             `json:"collectionError,omitempty"`
+	Name                        string             `json:"name"`
+	DataPoints                  []MetricsDataPoint `json:"dataPoints"`
+	CollectionError             string             `json:"collectionError,omitempty"`
+	RawCollectionError          string             `json:"rawCollectionError,omitempty"`
+	MetricsUnavailableDiagnosis string             `json:"metricsUnavailableDiagnosis,omitempty"`
+	MetricsUnavailable          bool               `json:"metricsUnavailable,omitempty"`
 }
 
 // TopPodMetrics holds the latest metrics snapshot for a single pod.
@@ -163,6 +171,37 @@ func (rb *ringBuffer) GetAll() []MetricsDataPoint {
 	return result
 }
 
+func metricsCollectionErrorLevel(err error) string {
+	if MetricsAPIUnavailable(err) {
+		return "warning"
+	}
+	return "error"
+}
+
+func MetricsAPIUnavailable(err error) bool {
+	if err == nil {
+		return false
+	}
+	if apierrors.IsNotFound(err) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	if !strings.Contains(msg, "metrics") {
+		return false
+	}
+	if apierrors.IsServiceUnavailable(err) {
+		return true
+	}
+	return strings.Contains(msg, "not found") ||
+		strings.Contains(msg, "could not find the requested resource") ||
+		strings.Contains(msg, "no matches for kind") ||
+		strings.Contains(msg, "no resource matches") ||
+		strings.Contains(msg, "no metrics known") ||
+		strings.Contains(msg, "not available") ||
+		strings.Contains(msg, "unable to fetch metrics") ||
+		strings.Contains(msg, "currently unable to handle the request")
+}
+
 // NewMetricsHistoryStore creates a MetricsHistoryStore. Call Start() to begin polling.
 func NewMetricsHistoryStore(client dynamic.Interface) *MetricsHistoryStore {
 	return &MetricsHistoryStore{
@@ -249,7 +288,7 @@ func (s *MetricsHistoryStore) collectPodMetrics(ctx context.Context, now time.Ti
 		if shouldReport {
 			log.Printf("[metrics] Pod metrics collection failed (count=%d): %v", count, err)
 			if s.OnError != nil {
-				s.OnError("metrics", "error", "pod metrics collection failed (count=%d): %v", count, err)
+				s.OnError("metrics", metricsCollectionErrorLevel(err), "pod metrics collection failed (count=%d): %v", count, err)
 			}
 		}
 		return
@@ -356,7 +395,7 @@ func (s *MetricsHistoryStore) collectNodeMetrics(ctx context.Context, now time.T
 		if shouldReport {
 			log.Printf("[metrics] Node metrics collection failed (count=%d): %v", count, err)
 			if s.OnError != nil {
-				s.OnError("metrics", "error", "node metrics collection failed (count=%d): %v", count, err)
+				s.OnError("metrics", metricsCollectionErrorLevel(err), "node metrics collection failed (count=%d): %v", count, err)
 			}
 		}
 		return

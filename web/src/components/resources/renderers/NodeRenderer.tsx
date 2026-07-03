@@ -1,6 +1,6 @@
 import { NodeRenderer as BaseNodeRenderer } from '@skyhook-io/k8s-ui/components/resources/renderers/NodeRenderer'
 import { useNavigate } from 'react-router-dom'
-import { useNodeMetrics, useNodeMetricsHistory, usePrometheusResourceMetrics, usePrometheusStatus } from '../../../api/client'
+import { getVisibleLiveMetrics, isLiveMetricsUnavailable, shouldFetchLiveMetrics, useNodeMetrics, useNodeMetricsHistory, usePrometheusResourceMetrics, usePrometheusStatus } from '../../../api/client'
 import { serializeColumnFilters } from '../resource-utils'
 
 interface NodeRendererProps {
@@ -13,8 +13,13 @@ export function NodeRenderer({ data, relationships }: NodeRendererProps) {
   const nodeName = data.metadata?.name
 
   // Fetch node metrics
-  const { data: metrics } = useNodeMetrics(nodeName)
-  const { data: metricsHistory } = useNodeMetricsHistory(nodeName)
+  const metricsHistoryQuery = useNodeMetricsHistory(nodeName)
+  const { data: metricsHistory } = metricsHistoryQuery
+  const historyMetricsUnavailable = metricsHistory?.metricsUnavailable === true
+  const liveMetricsEnabled = shouldFetchLiveMetrics(metricsHistoryQuery.isFetched || metricsHistoryQuery.isError, historyMetricsUnavailable)
+  const { data: metrics } = useNodeMetrics(nodeName, { enabled: liveMetricsEnabled })
+  const metricsUnavailable = historyMetricsUnavailable || isLiveMetricsUnavailable(liveMetricsEnabled, metrics)
+  const visibleMetrics = getVisibleLiveMetrics(liveMetricsEnabled, metricsUnavailable, metrics)
 
   // Determine whether to hide metrics-server section (Prometheus has data)
   const { data: prometheusStatus } = usePrometheusStatus()
@@ -36,8 +41,9 @@ export function NodeRenderer({ data, relationships }: NodeRendererProps) {
         params.set('filters', serializeColumnFilters({ node: [nodeName] }))
         navigate(`/resources/pods?${params.toString()}`)
       } : undefined}
-      metrics={metrics}
+      metrics={visibleMetrics}
       metricsHistory={metricsHistory}
+      metricsUnavailable={metricsUnavailable}
       hideMetricsServer={hideMetricsServer}
     />
   )

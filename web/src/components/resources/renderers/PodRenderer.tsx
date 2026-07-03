@@ -3,7 +3,7 @@ import type { CopyHandler } from '@skyhook-io/k8s-ui/components/ui/drawer-compon
 import type { ResolvedEnvFrom } from '@skyhook-io/k8s-ui'
 import { useOpenTerminal, useOpenLogs } from '../../dock'
 import { useNamespacedCapabilities, useIsLocalDeployment } from '../../../contexts/CapabilitiesContext'
-import { usePodMetrics, usePodMetricsHistory, usePrometheusResourceMetrics, usePrometheusStatus } from '../../../api/client'
+import { getVisibleLiveMetrics, isLiveMetricsUnavailable, shouldFetchLiveMetrics, usePodMetrics, usePodMetricsHistory, usePrometheusResourceMetrics, usePrometheusStatus } from '../../../api/client'
 import { useRBACSubject } from '../../../api/rbac'
 import { PortForwardInlineButton } from '../../portforward/PortForwardButton'
 import { ImageFilesystemModal } from '../ImageFilesystemModal'
@@ -34,8 +34,13 @@ export function PodRenderer({ data, onCopy, copied, onNavigate, onOpenLogs, reso
   const showPortForward = canPortForward || !isLocal
 
   // Metrics
-  const { data: metrics } = usePodMetrics(namespace, podName)
-  const { data: metricsHistory } = usePodMetricsHistory(namespace, podName)
+  const metricsHistoryQuery = usePodMetricsHistory(namespace, podName)
+  const { data: metricsHistory } = metricsHistoryQuery
+  const historyMetricsUnavailable = metricsHistory?.metricsUnavailable === true
+  const liveMetricsEnabled = shouldFetchLiveMetrics(metricsHistoryQuery.isFetched || metricsHistoryQuery.isError, historyMetricsUnavailable)
+  const { data: metrics } = usePodMetrics(namespace, podName, { enabled: liveMetricsEnabled })
+  const metricsUnavailable = historyMetricsUnavailable || isLiveMetricsUnavailable(liveMetricsEnabled, metrics)
+  const visibleMetrics = getVisibleLiveMetrics(liveMetricsEnabled, metricsUnavailable, metrics)
 
   // Hide metrics-server section when Prometheus has CPU data
   const { data: prometheusStatus } = usePrometheusStatus()
@@ -82,8 +87,9 @@ export function PodRenderer({ data, onCopy, copied, onNavigate, onOpenLogs, reso
           disabled={disabled}
         />
       )}
-      metrics={metrics}
+      metrics={visibleMetrics}
       metricsHistory={metricsHistory}
+      metricsUnavailable={metricsUnavailable}
       hideMetricsServer={hideMetricsServer}
       renderImageBrowser={({ image, namespace: ns, podName: pod, pullSecrets, onClose, onSwitchToPodFiles }) => (
         <ImageFilesystemModal

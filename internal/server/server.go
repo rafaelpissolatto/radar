@@ -28,6 +28,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
@@ -48,6 +49,7 @@ import (
 	"github.com/skyhook-io/radar/internal/updater"
 	"github.com/skyhook-io/radar/internal/version"
 	"github.com/skyhook-io/radar/pkg/hpadiag"
+	"github.com/skyhook-io/radar/pkg/k8score"
 	"github.com/skyhook-io/radar/pkg/perfstats"
 	"github.com/skyhook-io/radar/pkg/rbac"
 	topology "github.com/skyhook-io/radar/pkg/topology"
@@ -2188,7 +2190,7 @@ func (s *Server) handlePodMetrics(w http.ResponseWriter, r *http.Request) {
 
 	metrics, err := k8s.GetPodMetrics(r.Context(), namespace, name)
 	if err != nil {
-		if strings.Contains(err.Error(), "not found") {
+		if k8score.MetricsAPIUnavailable(err) {
 			s.writeError(w, http.StatusNotFound, "Pod metrics not found (metrics-server may not be installed)")
 			return
 		}
@@ -2209,7 +2211,7 @@ func (s *Server) handleNodeMetrics(w http.ResponseWriter, r *http.Request) {
 
 	metrics, err := k8s.GetNodeMetrics(r.Context(), name)
 	if err != nil {
-		if strings.Contains(err.Error(), "not found") {
+		if k8score.MetricsAPIUnavailable(err) {
 			s.writeError(w, http.StatusNotFound, "Node metrics not found (metrics-server may not be installed)")
 			return
 		}
@@ -2218,6 +2220,181 @@ func (s *Server) handleNodeMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.writeJSON(w, metrics)
+}
+
+const (
+	metricsAPIServiceKind  = "APIService"
+	metricsAPIServiceGroup = "apiregistration.k8s.io"
+	metricsAPIServiceName  = "v1beta1.metrics.k8s.io"
+)
+
+var metricsAPIServiceDiagnosisMemo = metricsAPIServiceDiagnosisCache{
+	ttl: 5 * time.Second,
+}
+
+type metricsAPIServiceDiagnosisCache struct {
+	mu      sync.Mutex
+	ttl     time.Duration
+	entries map[bool]metricsAPIServiceDiagnosisEntry
+}
+
+type metricsAPIServiceDiagnosisEntry struct {
+	contextName string
+	expiresAt   time.Time
+	diagnosis   string
+}
+
+func (c *metricsAPIServiceDiagnosisCache) get(contextName string, includeConditionMessage bool, build func() (string, bool)) string {
+	if c == nil || c.ttl <= 0 {
+		diagnosis, _ := build()
+		return diagnosis
+	}
+
+	c.mu.Lock()
+	if c.entries == nil {
+		c.entries = make(map[bool]metricsAPIServiceDiagnosisEntry, 2)
+	}
+	if entry, ok := c.entries[includeConditionMessage]; ok && entry.contextName == contextName && time.Now().Before(entry.expiresAt) {
+		c.mu.Unlock()
+		return entry.diagnosis
+	}
+	c.mu.Unlock()
+
+	diagnosis, cacheable := build()
+	if !cacheable {
+		return diagnosis
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.entries == nil {
+		c.entries = make(map[bool]metricsAPIServiceDiagnosisEntry, 2)
+	}
+	now := time.Now()
+	if entry, ok := c.entries[includeConditionMessage]; ok && entry.contextName != contextName && now.Before(entry.expiresAt) {
+		return diagnosis
+	}
+	c.entries[includeConditionMessage] = metricsAPIServiceDiagnosisEntry{
+		contextName: contextName,
+		diagnosis:   diagnosis,
+		expiresAt:   now.Add(c.ttl),
+	}
+	return diagnosis
+}
+
+func metricsHistoryCollectionError(ctx context.Context, source, errMsg string, includeAPIServiceConditionMessage bool) (string, string, string, bool) {
+	if errMsg == "" {
+		return "", "", "", false
+	}
+	if k8score.MetricsAPIUnavailable(fmt.Errorf("failed to get %s metrics: %s", strings.ToLower(source), errMsg)) {
+		return fmt.Sprintf("%s metrics not found (metrics-server may not be installed)", source), errMsg, metricsUnavailableDiagnosis(ctx, includeAPIServiceConditionMessage), true
+	}
+	return errMsg, "", "", false
+}
+
+func metricsUnavailableDiagnosis(ctx context.Context, includeAPIServiceConditionMessage bool) string {
+	cache := k8s.GetResourceCache()
+	if cache == nil {
+		return ""
+	}
+
+	contextName := k8s.GetContextName()
+	return metricsAPIServiceDiagnosisMemo.get(contextName, includeAPIServiceConditionMessage, func() (string, bool) {
+		apiService, err := cache.GetDynamicWithGroup(ctx, metricsAPIServiceKind, "", metricsAPIServiceName, metricsAPIServiceGroup)
+		return metricsAPIServiceLookupDiagnosis(apiService, err, includeAPIServiceConditionMessage), isMetricsAPIServiceLookupCacheable(apiService, err)
+	})
+}
+
+func isMetricsAPIServiceLookupCacheable(apiService *unstructured.Unstructured, err error) bool {
+	if err == nil {
+		return apiService != nil
+	}
+	return apierrors.IsNotFound(err) || errors.Is(err, k8score.ErrResourceNotFound)
+}
+
+func metricsAPIServiceLookupDiagnosis(apiService *unstructured.Unstructured, err error, includeConditionMessage bool) string {
+	if err != nil {
+		if apierrors.IsNotFound(err) || errors.Is(err, k8score.ErrResourceNotFound) {
+			return "The v1beta1.metrics.k8s.io APIService is not registered. Install metrics-server or restore that APIService."
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return ""
+		}
+		log.Printf("[metrics] Failed to inspect %s APIService for metrics unavailable diagnosis: %v", metricsAPIServiceName, err)
+		return ""
+	}
+	if apiService == nil {
+		return ""
+	}
+	return metricsAPIServiceDiagnosis(apiService, includeConditionMessage)
+}
+
+func metricsAPIServiceDiagnosis(apiService *unstructured.Unstructured, includeConditionMessage bool) string {
+	conditions, found, _ := unstructured.NestedSlice(apiService.Object, "status", "conditions")
+	if !found {
+		return "The v1beta1.metrics.k8s.io APIService exists but has no Available condition. Check metrics-server and API aggregation status."
+	}
+
+	for _, condition := range conditions {
+		conditionMap, ok := condition.(map[string]any)
+		if !ok {
+			continue
+		}
+		conditionType, _ := conditionMap["type"].(string)
+		if conditionType != "Available" {
+			continue
+		}
+
+		status, _ := conditionMap["status"].(string)
+		reason, _ := conditionMap["reason"].(string)
+		reasonSuffix := ""
+		if reason != "" {
+			reasonSuffix = " (" + reason + ")"
+		}
+		messageSuffix := ""
+		if includeConditionMessage {
+			messageSuffix = metricsAPIServiceConditionMessageSuffix(conditionMap)
+		}
+
+		switch status {
+		case "True":
+			return "The v1beta1.metrics.k8s.io APIService is Available, but metrics reads still fail. Check metrics-server logs and API aggregation errors."
+		case "False", "Unknown":
+			return metricsAPIServiceDiagnosisSentence(
+				"The v1beta1.metrics.k8s.io APIService is not Available"+reasonSuffix+messageSuffix,
+				"Check the metrics-server Service, endpoints, and API aggregation/TLS configuration.",
+			)
+		default:
+			return metricsAPIServiceDiagnosisSentence(
+				"The v1beta1.metrics.k8s.io APIService has an unexpected Available status"+reasonSuffix+messageSuffix,
+				"Check metrics-server and API aggregation status.",
+			)
+		}
+	}
+
+	return "The v1beta1.metrics.k8s.io APIService exists but has no Available condition. Check metrics-server and API aggregation status."
+}
+
+func metricsAPIServiceConditionMessageSuffix(conditionMap map[string]any) string {
+	message, _ := conditionMap["message"].(string)
+	message = strings.Join(strings.Fields(message), " ")
+	message = strings.TrimRight(message, ":;,")
+	if message == "" {
+		return ""
+	}
+
+	const maxRunes = 180
+	runes := []rune(message)
+	if len(runes) > maxRunes {
+		message = string(runes[:maxRunes]) + "..."
+	}
+	return ": " + message
+}
+
+func metricsAPIServiceDiagnosisSentence(subject, action string) string {
+	if strings.HasSuffix(subject, ".") || strings.HasSuffix(subject, "?") || strings.HasSuffix(subject, "!") {
+		return subject + " " + action
+	}
+	return subject + ". " + action
 }
 
 // handlePodMetricsHistory returns historical metrics for a specific pod
@@ -2236,21 +2413,23 @@ func (s *Server) handlePodMetricsHistory(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	history := store.GetPodMetricsHistory(namespace, name)
+	includeAPIServiceConditionMessage := s.canRead(r, metricsAPIServiceGroup, "apiservices", "", "get")
+	history := podMetricsHistoryResponse(r.Context(), store.GetPodMetricsHistory(namespace, name), namespace, name, store.CollectionHealth(), includeAPIServiceConditionMessage)
+	s.writeJSON(w, history)
+}
+
+func podMetricsHistoryResponse(ctx context.Context, history *k8s.PodMetricsHistory, namespace, name string, health k8s.MetricsCollectionHealth, includeAPIServiceConditionMessage bool) *k8s.PodMetricsHistory {
 	if history == nil {
-		// Return empty history — include collection error if metrics are failing
 		history = &k8s.PodMetricsHistory{
 			Namespace:  namespace,
 			Name:       name,
 			Containers: []k8s.ContainerMetricsHistory{},
 		}
-		health := store.CollectionHealth()
-		if health.PodMetrics.ConsecutiveErrors > 0 {
-			history.CollectionError = health.PodMetrics.LastError
-		}
 	}
-
-	s.writeJSON(w, history)
+	if health.PodMetrics.ConsecutiveErrors > 0 {
+		history.CollectionError, history.RawCollectionError, history.MetricsUnavailableDiagnosis, history.MetricsUnavailable = metricsHistoryCollectionError(ctx, "Pod", health.PodMetrics.LastError, includeAPIServiceConditionMessage)
+	}
+	return history
 }
 
 // handleNodeMetricsHistory returns historical metrics for a specific node
@@ -2267,19 +2446,22 @@ func (s *Server) handleNodeMetricsHistory(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	history := store.GetNodeMetricsHistory(name)
+	includeAPIServiceConditionMessage := s.canRead(r, metricsAPIServiceGroup, "apiservices", "", "get")
+	history := nodeMetricsHistoryResponse(r.Context(), store.GetNodeMetricsHistory(name), name, store.CollectionHealth(), includeAPIServiceConditionMessage)
+	s.writeJSON(w, history)
+}
+
+func nodeMetricsHistoryResponse(ctx context.Context, history *k8s.NodeMetricsHistory, name string, health k8s.MetricsCollectionHealth, includeAPIServiceConditionMessage bool) *k8s.NodeMetricsHistory {
 	if history == nil {
 		history = &k8s.NodeMetricsHistory{
 			Name:       name,
 			DataPoints: []k8s.MetricsDataPoint{},
 		}
-		health := store.CollectionHealth()
-		if health.NodeMetrics.ConsecutiveErrors > 0 {
-			history.CollectionError = health.NodeMetrics.LastError
-		}
 	}
-
-	s.writeJSON(w, history)
+	if health.NodeMetrics.ConsecutiveErrors > 0 {
+		history.CollectionError, history.RawCollectionError, history.MetricsUnavailableDiagnosis, history.MetricsUnavailable = metricsHistoryCollectionError(ctx, "Node", health.NodeMetrics.LastError, includeAPIServiceConditionMessage)
+	}
+	return history
 }
 
 // handleTopPods returns the latest metrics for all pods (bulk endpoint for table view)
