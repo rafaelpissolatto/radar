@@ -2015,6 +2015,7 @@ function getInitialFiltersFromURL() {
   const columnFilters = parseColumnFilters(params.get('filters'))
   const result = {
     search: params.get('search') || '',
+    regex: params.get('regex') === 'true',
     columnFilters,
     problemFilters: params.get('problems')?.split(',').filter(Boolean) || [],
     showInactive: params.get('showInactive') === 'true',
@@ -2094,7 +2095,7 @@ export function ResourcesView({
     setBulkForceDelete(false)
   }, [selectedKind.name, selectedKind.group]) // eslint-disable-line react-hooks/exhaustive-deps
   const [searchTerm, setSearchTerm] = useState(initialFilters.search)
-  const [regexMode, setRegexMode] = useState(false)
+  const [regexMode, setRegexMode] = useState(initialFilters.regex)
   const [sortColumn, setSortColumn] = useState<string | null>(null)
   const [sortDirection, setSortDirection] = useState<SortDirection>(null)
   // Filter state
@@ -2843,6 +2844,11 @@ export function ResourcesView({
       setSearchTerm(newFilters.search)
     }
 
+    // Update regex mode if it changed
+    if (newFilters.regex !== regexMode) {
+      setRegexMode(newFilters.regex)
+    }
+
     // Update column filters if changed
     const newFiltersStr = serializeColumnFilters(newFilters.columnFilters)
     const currentFiltersStr = serializeColumnFilters(columnFilters)
@@ -2873,6 +2879,7 @@ export function ResourcesView({
   const updateURL = useCallback((
     kindInfo: SelectedKindInfo,
     search: string,
+    regex: boolean,
     colFilters: Record<string, string[]>,
     problems: string[],
     showInactive: boolean,
@@ -2894,6 +2901,11 @@ export function ResourcesView({
       params.set('search', search)
     } else {
       params.delete('search')
+    }
+    if (regex) {
+      params.set('regex', 'true')
+    } else {
+      params.delete('regex')
     }
     // Write column filters as `filters` param; remove legacy `status` param
     const filtersStr = serializeColumnFilters(colFilters)
@@ -2956,6 +2968,7 @@ export function ResourcesView({
 
   const clearAllFilters = useCallback(() => {
     setSearchTerm('')
+    setRegexMode(false)
     setColumnFilters({})
     setProblemFilters([])
     setLabelSelector('')
@@ -2966,7 +2979,7 @@ export function ResourcesView({
     // params are out of scope here; the host's onClearNamespaces (and its
     // own state→URL sync) owns namespace cleanup.
     const params = new URLSearchParams(window.location.search)
-    for (const key of ['search', 'filters', 'problems', 'labels', 'ownerKind', 'ownerName', 'showInactive']) {
+    for (const key of ['search', 'regex', 'filters', 'problems', 'labels', 'ownerKind', 'ownerName', 'showInactive']) {
       params.delete(key)
     }
     navigate({ pathname: window.location.pathname, search: params.toString() }, { replace: true })
@@ -3023,8 +3036,8 @@ export function ResourcesView({
     shouldPushHistory.current = false
     prevSelectedResourceRef.current = current
 
-    updateURL(selectedKind, searchTerm, columnFilters, problemFilters, showInactiveReplicaSets, selectedResource?.namespace, selectedResource?.name, pushHistory)
-  }, [selectedKind, searchTerm, columnFilters, problemFilters, showInactiveReplicaSets, selectedResource, updateURL, basePath, locationPathname])
+    updateURL(selectedKind, searchTerm, regexMode, columnFilters, problemFilters, showInactiveReplicaSets, selectedResource?.namespace, selectedResource?.name, pushHistory)
+  }, [selectedKind, searchTerm, regexMode, columnFilters, problemFilters, showInactiveReplicaSets, selectedResource, updateURL, basePath, locationPathname])
 
   // Handle resource click from URL on mount
   useEffect(() => {
@@ -3927,6 +3940,7 @@ export function ResourcesView({
   // a no-op for that case.
   const hasAnyFilter =
     !!searchTerm ||
+    regexMode ||
     !!labelSelector ||
     hasOwnerFilter ||
     problemFilters.length > 0 ||
@@ -4042,7 +4056,8 @@ export function ResourcesView({
                   }
                 }}
                 className={clsx(
-                  'w-full pl-10 pr-10 py-2 bg-theme-elevated border rounded-lg text-sm text-theme-text-primary placeholder-theme-text-disabled focus:outline-none focus:ring-2',
+                  'w-full pl-10 py-2 bg-theme-elevated border rounded-lg text-sm text-theme-text-primary placeholder-theme-text-disabled focus:outline-none focus:ring-2',
+                  searchTerm ? 'pr-16' : 'pr-10',
                   searchRegex.error
                     ? 'border-red-500/60 focus:ring-red-500'
                     : 'border-theme-border-light focus:ring-skyhook-500'
@@ -4055,7 +4070,8 @@ export function ResourcesView({
                 aria-label={regexMode ? 'Disable regex search' : 'Enable regex search'}
                 title={regexMode ? 'Regex search enabled — click to disable' : 'Enable regex search'}
                 className={clsx(
-                  'absolute right-2 top-1/2 -translate-y-1/2 flex items-center justify-center w-6 h-6 rounded transition-colors',
+                  'absolute top-1/2 -translate-y-1/2 flex items-center justify-center w-6 h-6 rounded transition-colors',
+                  searchTerm ? 'right-9' : 'right-2',
                   regexMode
                     ? 'bg-skyhook-500/20 text-skyhook-400'
                     : 'text-theme-text-tertiary hover:text-theme-text-primary hover:bg-theme-hover'
@@ -4063,6 +4079,19 @@ export function ResourcesView({
               >
                 <Regex className="w-3.5 h-3.5" />
               </button>
+              {searchTerm && (
+                <button
+                  type="button"
+                  aria-label="Clear search"
+                  onClick={() => {
+                    setSearchTerm('')
+                    searchInputRef.current?.focus()
+                  }}
+                  className="absolute right-2 top-1/2 -translate-y-1/2 flex items-center justify-center w-6 h-6 rounded text-theme-text-tertiary hover:text-theme-text-primary hover:bg-theme-hover transition-colors"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              )}
               {searchRegex.error && (
                 <div
                   title={searchRegex.error}
@@ -4517,7 +4546,10 @@ export function ResourcesView({
               <p>No {selectedKind.kind} found</p>
               {searchTerm && (
                 <button
-                  onClick={() => setSearchTerm('')}
+                  onClick={() => {
+                    setSearchTerm('')
+                    setRegexMode(false)
+                  }}
                   className="flex items-center gap-1.5 text-sm mt-2 px-3 py-1.5 rounded-md bg-theme-elevated hover:bg-theme-border text-theme-text-secondary hover:text-theme-text-primary transition-colors"
                 >
                   No results for "{searchTerm}"
