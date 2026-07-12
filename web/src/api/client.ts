@@ -983,7 +983,7 @@ export function useNamespaces() {
 }
 
 // Topology (for manual refresh)
-export function useTopology(namespaces: string[], viewMode: string = 'resources', options?: { enabled?: boolean }) {
+export function useTopology(namespaces: string[], viewMode: string = 'resources', options?: { enabled?: boolean; refetchInterval?: number | false }) {
   const params = new URLSearchParams()
   if (namespaces.length > 0) params.set('namespaces', namespaces.join(','))
   if (viewMode) params.set('view', viewMode)
@@ -994,6 +994,7 @@ export function useTopology(namespaces: string[], viewMode: string = 'resources'
     queryFn: () => fetchJSON(`/topology${queryString ? `?${queryString}` : ''}`),
     staleTime: 5000, // 5 seconds
     enabled: options?.enabled !== false,
+    refetchInterval: options?.refetchInterval,
   })
 }
 
@@ -1071,7 +1072,7 @@ export function useGitOpsInsights(kind: string, namespace: string, name: string,
 
 // Generic resource fetching - returns resource with relationships
 // Uses '_' as placeholder for cluster-scoped resources (empty namespace)
-export function useResource<T>(kind: string, namespace: string, name: string, group?: string) {
+export function useResource<T>(kind: string, namespace: string, name: string, group?: string, options?: { enabled?: boolean; refetchInterval?: number | false }) {
   // For cluster-scoped resources, use '_' as namespace placeholder
   const ns = namespace || '_'
   const params = new URLSearchParams()
@@ -1081,7 +1082,8 @@ export function useResource<T>(kind: string, namespace: string, name: string, gr
   const query = useQuery<ResourceWithRelationships<T>>({
     queryKey: ['resource', kind, namespace, name, group],
     queryFn: () => fetchJSON(`/resources/${kind}/${ns}/${name}${queryString ? `?${queryString}` : ''}`),
-    enabled: Boolean(kind && name),  // namespace can be empty for cluster-scoped resources
+    enabled: (options?.enabled ?? true) && Boolean(kind && name),  // namespace can be empty for cluster-scoped resources
+    refetchInterval: options?.refetchInterval,
   })
 
   // Extract resource and relationships from the response
@@ -2311,6 +2313,17 @@ export function useApplyResource() {
 // CronJob operations
 // ============================================================================
 
+function invalidateCronJobOperationQueries(queryClient: ReturnType<typeof useQueryClient>, namespace: string, name: string) {
+  queryClient.invalidateQueries({ queryKey: ['resources', 'cronjobs'] })
+  queryClient.invalidateQueries({ queryKey: ['resources', 'jobs'] })
+  queryClient.invalidateQueries({ queryKey: ['resource', 'cronjobs', namespace, name] })
+  queryClient.invalidateQueries({ queryKey: ['workload-runs', 'cronjobs', namespace, name] })
+  queryClient.invalidateQueries({ queryKey: ['applications'] })
+  queryClient.invalidateQueries({ queryKey: ['dashboard'] })
+  queryClient.invalidateQueries({ queryKey: ['resource-counts'] })
+  queryClient.invalidateQueries({ queryKey: ['topology'] })
+}
+
 // Trigger a CronJob (create a Job from it)
 export function useTriggerCronJob() {
   const queryClient = useQueryClient()
@@ -2330,10 +2343,8 @@ export function useTriggerCronJob() {
       errorMessage: 'Failed to trigger CronJob',
       successMessage: 'CronJob triggered',
     },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['resources', 'cronjobs'] })
-      queryClient.invalidateQueries({ queryKey: ['resources', 'jobs'] })
-      queryClient.invalidateQueries({ queryKey: ['topology'] })
+    onSuccess: (_, variables) => {
+      invalidateCronJobOperationQueries(queryClient, variables.namespace, variables.name)
     },
   })
 }
@@ -2357,9 +2368,8 @@ export function useSuspendCronJob() {
       errorMessage: 'Failed to suspend CronJob',
       successMessage: 'CronJob suspended',
     },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['resources', 'cronjobs'] })
-      queryClient.invalidateQueries({ queryKey: ['topology'] })
+    onSuccess: (_, variables) => {
+      invalidateCronJobOperationQueries(queryClient, variables.namespace, variables.name)
     },
   })
 }
@@ -2383,9 +2393,8 @@ export function useResumeCronJob() {
       errorMessage: 'Failed to resume CronJob',
       successMessage: 'CronJob resumed',
     },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['resources', 'cronjobs'] })
-      queryClient.invalidateQueries({ queryKey: ['topology'] })
+    onSuccess: (_, variables) => {
+      invalidateCronJobOperationQueries(queryClient, variables.namespace, variables.name)
     },
   })
 }
@@ -3706,6 +3715,44 @@ export interface WorkloadLogsResponse {
     timestamp: string
     content: string
   }[]
+  emptyReason?: string
+  emptyMessage?: string
+  command?: string
+}
+
+export interface WorkloadRun {
+  kind: string
+  namespace: string
+  name: string
+  phase: string
+  active: boolean
+  startedAt?: string
+  finishedAt?: string
+  scheduledAt?: string
+  trigger?: 'manual' | 'schedule' | string
+  message?: string
+  succeeded?: number
+  failed?: number
+  running?: number
+  desired?: number
+  parallelism?: number
+  progress?: string
+  template?: string
+  launcher?: {
+    kind: string
+    namespace?: string
+    name: string
+    group?: string
+  }
+  podTotal?: number
+  podSucceeded?: number
+  podFailed?: number
+  podRunning?: number
+  podPending?: number
+}
+
+export interface WorkloadRunsResponse {
+  runs: WorkloadRun[]
 }
 
 // Fetch pods for a workload
@@ -3715,6 +3762,24 @@ export function useWorkloadPods(kind: string, namespace: string, name: string) {
     queryFn: () => fetchJSON(`/workloads/${kind}/${namespace}/${name}/pods`),
     enabled: Boolean(kind && namespace && name),
     staleTime: 10000, // 10 seconds - pods can change
+  })
+}
+
+export function useWorkloadRuns(kind: string, namespace: string, name: string, enabled = true, options?: { refetchActive?: boolean; clusterScoped?: boolean }) {
+  const clusterScoped = options?.clusterScoped ?? false
+  const ns = clusterScoped ? '_' : namespace
+  const params = new URLSearchParams()
+  if (clusterScoped) params.set('clusterScoped', 'true')
+  const queryString = params.toString()
+
+  return useQuery<WorkloadRunsResponse>({
+    queryKey: ['workload-runs', kind, namespace, name, clusterScoped],
+    queryFn: () => fetchJSON(`/workloads/${kind}/${ns}/${name}/runs${queryString ? `?${queryString}` : ''}`),
+    enabled: enabled && Boolean(kind && name && (namespace || clusterScoped)),
+    staleTime: 10000,
+    refetchInterval: options?.refetchActive
+      ? (query) => query.state.data?.runs?.some((run) => run.active) ? 5000 : 30000
+      : false,
   })
 }
 
