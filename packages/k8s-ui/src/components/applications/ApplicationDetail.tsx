@@ -1,49 +1,19 @@
-import {
-  useMemo,
-  useState,
-  useCallback,
-  useEffect,
-  useRef,
-  type ReactNode,
-} from "react";
-import {
-  AlertTriangle,
-  ArrowLeft,
-  Boxes,
-  CheckCircle2,
-  ChevronDown,
-  Clock3,
-  ExternalLink,
-  Layers,
-  Search,
-} from "lucide-react";
-import { clsx } from "clsx";
-import type { ResourceRef, Topology, TopologyNode } from "../../types";
-import { StatusDot, mapHealthToTone } from "../ui/status-tone";
-import { Tooltip } from "../ui/Tooltip";
-import { EmptyState } from "../ui/EmptyState";
-import { ResourceRefBadge } from "../ui/drawer-components";
-import { TopologyGraph } from "../topology/TopologyGraph";
-import { pluralize } from "../../utils/pluralize";
-import {
-  kindToPlural,
-  apiVersionToGroup,
-  refToSelectedResource,
-} from "../../utils/navigation";
-import {
-  batchRunParentNodes,
-  tagWorkloadOwnership,
-  seedNodeIds,
-  ownershipOf,
-  workloadKey,
-  type NeighborhoodSeed,
-} from "../../utils/topology-neighborhood";
-import {
-  workloadHue,
-  NEUTRAL_OWNER,
-  type WorkloadFocus,
-} from "../../utils/workload-colors";
-import { getTopologyIcon } from "../../utils/resource-icons";
+import { useMemo, useState, useCallback, useEffect, useRef, type ReactNode } from 'react'
+import { AlertTriangle, ArrowLeft, Boxes, ChevronDown, ExternalLink, Layers, Radio, Search } from 'lucide-react'
+import { clsx } from 'clsx'
+import type { ResourceRef, Topology, TopologyNode } from '../../types'
+import argoCdLogo from '../../assets/gitops/argocd.png'
+import fluxLogo from '../../assets/gitops/flux.svg'
+import { StatusDot, mapHealthToTone } from '../ui/status-tone'
+import { Tooltip } from '../ui/Tooltip'
+import { EmptyState } from '../ui/EmptyState'
+import { ResourceRefBadge } from '../ui/drawer-components'
+import { TopologyGraph } from '../topology/TopologyGraph'
+import { pluralize } from '../../utils/pluralize'
+import { kindToPlural, refToSelectedResource } from '../../utils/navigation'
+import { batchRunParentNodes, tagWorkloadOwnership, seedNodeIds, ownershipOf, workloadKey, type NeighborhoodSeed } from '../../utils/topology-neighborhood'
+import { workloadHue, NEUTRAL_OWNER, type WorkloadFocus } from '../../utils/workload-colors'
+import { getTopologyIcon } from '../../utils/resource-icons'
 import {
   type AppRow,
   type AppHistory,
@@ -64,24 +34,22 @@ import {
   batchSignalForApp,
   batchActivityForApp,
   batchRuntimeForApp,
+  applicationDisplayHealth,
+  sourceReportedHealth,
+  sourceSyncHealth,
   servingReadiness,
   worstHealth,
   appGroupLagMessage,
   compareVersions,
   appSourceLabel,
   overlayProvenance,
-} from "../../utils/applications";
-import { PaneLoader } from "../ui/PaneLoader";
-import { midTruncate } from "../../utils/format";
-import { VersionTooltip, AppIdentityTooltip } from "./AppTooltips";
-import {
-  ProvenanceBadge,
-  ClassBadge,
-  CategoryChip,
-  VersionInfo,
-  BatchSignalChip,
-} from "./AppChips";
-import { ReadyBar } from "./ReadyBar";
+} from '../../utils/applications'
+import { PaneLoader } from '../ui/PaneLoader'
+import { midTruncate } from '../../utils/format'
+import { VersionTooltip, AppIdentityTooltip } from './AppTooltips'
+import { ProvenanceBadge, ClassBadge, CategoryChip, VersionInfo, BatchSignalChip } from './AppChips'
+import { ReadyBar } from './ReadyBar'
+import { collapseStableReplicaSets, layerDeploymentInventory, topologyGroup, type DeploymentInventory, type DeploymentTopologyLayer } from '../../utils/application-topology'
 
 // ApplicationDetail owns the application chrome and scope switcher. The selected
 // scope decides the one tab row shown in the detail pane: app scope gets
@@ -148,12 +116,16 @@ export type ApplicationDetailProps = {
   renderWorkload: (workload: SelectedAppWorkload) => ReactNode;
   /** Render host-scoped operational issues for the app overview. */
   renderOverviewIssues?: () => ReactNode;
+  /** Whether the host-scoped issue surface contains current issues. */
+  hasOverviewIssues?: boolean;
   /** Resources-view topology spanning the app's namespaces. When present, it
    *  powers the application Topology view and workload hover focus. */
   topology?: Topology;
   /** True while the host's topology fetch is in flight. Without it, a
    *  multi-workload app can briefly show an empty topology while topology loads. */
-  topologyLoading?: boolean;
+  topologyLoading?: boolean
+  /** Exact resources reported by the app's Argo CD, Flux, or Helm deployment source. */
+  deploymentInventory?: DeploymentInventory
   /** Open a related (non-workload) resource clicked in the app graph. */
   onNavigateToResource?: (resource: {
     kind: string;
@@ -248,27 +220,7 @@ function compareDefinedVersions(
   return compareVersions(a, b) ?? 0;
 }
 
-export function ApplicationDetail({
-  app,
-  onBack,
-  renderWorkload,
-  renderOverviewIssues,
-  topology,
-  topologyLoading,
-  onNavigateToResource,
-  onSelectWorkloadRun,
-  identityInstances,
-  onSwitchInstance,
-  discoveredEnvs,
-  activeInstanceKey,
-  history,
-  historyLoading,
-  onOpenSource,
-  selectedWorkloadKey,
-  onSelectWorkload,
-  selectedView,
-  onSelectView,
-}: ApplicationDetailProps) {
+export function ApplicationDetail({ app, onBack, renderWorkload, renderOverviewIssues, hasOverviewIssues, topology, topologyLoading, deploymentInventory, onNavigateToResource, onSelectWorkloadRun, identityInstances, onSwitchInstance, discoveredEnvs, activeInstanceKey, history, historyLoading, onOpenSource, selectedWorkloadKey, onSelectWorkload, selectedView, onSelectView }: ApplicationDetailProps) {
   // Stable order regardless of API ordering: rail rows and the per-workload
   // color assignment both follow this array, so an order flap between
   // refetches must not reshuffle rows or reassign a workload's hue.
@@ -284,16 +236,12 @@ export function ApplicationDetail({
   );
   const workloadClass = workloadClassOf(app.workload_class);
   const batchRuntime = batchRuntimeForApp(app);
-  const servingWorkloads = workloads.filter((workload) => !workload.batch);
-  const overall =
-    workloadClass === "job"
-      ? batchRuntime.health
-      : servingWorkloads.length > 0
-        ? worstHealth(servingWorkloads.map((workload) => workload.health))
-        : healthOf(app.health);
+  const overall = applicationDisplayHealth(app);
   const verdictTone = HEALTH_META[overall].pill;
   const verdictLabel =
-    workloadClass === "job" ? batchRuntime.label : HEALTH_META[overall].label;
+    workloadClass === "job" && overall === batchRuntime.health
+      ? batchRuntime.label
+      : HEALTH_META[overall].label;
   const versions = useMemo(
     () => Array.from(new Set((app.versions || []).filter(Boolean))),
     [app.versions],
@@ -356,7 +304,17 @@ export function ApplicationDetail({
   // Hover-focus: the workload (or NEUTRAL_OWNER) whose nodes should stay lit
   // while the rest of the graph dims. Driven by the rail and, reciprocally, by
   // hovering a node.
-  const [focusedOwnerId, setFocusedOwnerId] = useState<WorkloadFocus>(null);
+  const [focusedOwnerId, setFocusedOwnerId] = useState<WorkloadFocus>(null)
+  const [expandedReplicaSetOwners, setExpandedReplicaSetOwners] = useState<Set<string>>(new Set())
+  useEffect(() => setExpandedReplicaSetOwners(new Set()), [app.key])
+  const toggleReplicaSets = useCallback((ownerID: string) => {
+    setExpandedReplicaSetOwners((current) => {
+      const next = new Set(current)
+      if (next.has(ownerID)) next.delete(ownerID)
+      else next.add(ownerID)
+      return next
+    })
+  }, [])
 
   const appSeeds = useMemo(
     () =>
@@ -369,11 +327,21 @@ export function ApplicationDetail({
     [workloads],
   );
   // Neighborhood subgraph + per-workload color/ownership tagging in one pass.
+  const composedTopology = useMemo(
+    () => topology ? collapseStableReplicaSets(topology, expandedReplicaSetOwners) : null,
+    [topology, expandedReplicaSetOwners],
+  )
   const ownership = useMemo(
-    () => (topology ? tagWorkloadOwnership(topology, appSeeds) : null),
-    [topology, appSeeds],
-  );
-  const appGraph = ownership?.topology ?? null;
+    () => (composedTopology ? tagWorkloadOwnership(composedTopology, appSeeds) : null),
+    [composedTopology, appSeeds],
+  )
+  const appGraph = ownership?.topology ?? null
+  const deploymentLayer = useMemo(
+    () => appGraph && deploymentInventory && app.sourceRef
+      ? layerDeploymentInventory(appGraph, deploymentInventory, sourceInventoryLabel(app.sourceRef))
+      : null,
+    [appGraph, deploymentInventory, app.sourceRef],
+  )
   const appGraphFocusId = useMemo(
     () => (topology ? seedNodeIds(topology, appSeeds)[0] : undefined),
     [topology, appSeeds],
@@ -401,11 +369,12 @@ export function ApplicationDetail({
   // (its runtime) or opens a related resource (Service/config/…) via the host.
   const handleAppNodeClick = useCallback(
     (node: TopologyNode) => {
-      const ns = (node.data?.namespace as string) || "";
-      const match = workloads.find(
-        (w) =>
-          w.kind === node.kind && w.name === node.name && w.namespace === ns,
-      );
+      if (node.data?.sourceInventoryGroup && app.sourceRef) {
+        onOpenSource?.(app.sourceRef)
+        return
+      }
+      const ns = (node.data?.namespace as string) || ''
+      const match = workloads.find((w) => w.kind === node.kind && w.name === node.name && w.namespace === ns)
       if (match) {
         setSelected(workloadKey(match));
         return;
@@ -429,21 +398,15 @@ export function ApplicationDetail({
         kind: kindToPlural(node.kind),
         namespace: ns,
         name: node.name,
-        group: apiVersionToGroup(node.data?.apiVersion as string | undefined),
-      });
+        group: topologyGroup(node),
+      })
     },
-    [
-      appGraph,
-      workloads,
-      onNavigateToResource,
-      onSelectWorkloadRun,
-      setSelected,
-    ],
-  );
+    [app.sourceRef, appGraph, workloads, onNavigateToResource, onOpenSource, onSelectWorkloadRun, setSelected],
+  )
 
-  const appTopology = appGraph ?? null;
-  const appTopologyAvailable = !!appTopology && appTopology.nodes.length > 0;
-  const colorByWorkload = ownership?.colorByWorkload ?? null;
+  const appTopology = deploymentLayer?.topology ?? appGraph ?? null
+  const appTopologyAvailable = !!appTopology && appTopology.nodes.length > 0
+  const colorByWorkload = ownership?.colorByWorkload ?? null
 
   return (
     <div className="flex min-h-0 w-full flex-1 flex-col bg-theme-base">
@@ -600,14 +563,13 @@ export function ApplicationDetail({
             activeView={activeView}
             onViewChange={setView}
             workloads={workloads}
-            namespace={namespace}
-            namespaces={namespaces}
-            verdictLabel={verdictLabel}
             ready={ready}
             desired={desired}
             versions={versions}
             topology={appTopology}
             topologyLoading={topologyLoading}
+            deploymentLayer={deploymentLayer}
+            deploymentSource={app.sourceRef}
             topologyAvailable={appTopologyAvailable}
             focusNodeId={appGraphFocusId}
             focusedOwnerId={focusedOwnerId}
@@ -620,7 +582,9 @@ export function ApplicationDetail({
             history={history}
             historyLoading={historyLoading}
             onOpenSource={onOpenSource}
+            onToggleReplicaSets={toggleReplicaSets}
             renderOverviewIssues={renderOverviewIssues}
+            hasOverviewIssues={hasOverviewIssues}
           />
         )}
       </div>
@@ -633,14 +597,13 @@ function ApplicationWorkspace({
   activeView,
   onViewChange,
   workloads,
-  namespace,
-  namespaces,
-  verdictLabel,
   ready,
   desired,
   versions,
   topology,
   topologyLoading,
+  deploymentLayer,
+  deploymentSource,
   topologyAvailable,
   focusNodeId,
   focusedOwnerId,
@@ -653,38 +616,36 @@ function ApplicationWorkspace({
   history,
   historyLoading,
   onOpenSource,
+  onToggleReplicaSets,
   renderOverviewIssues,
+  hasOverviewIssues,
 }: {
-  app: AppRow;
-  activeView: CanonicalApplicationView;
-  onViewChange: (view: CanonicalApplicationView) => void;
-  workloads: AppWorkload[];
-  namespace: string;
-  namespaces: string[];
-  verdictLabel: string;
-  ready: number;
-  desired: number;
-  versions: string[];
-  topology: Topology | null;
-  topologyLoading?: boolean;
-  topologyAvailable: boolean;
-  focusNodeId?: string;
-  focusedOwnerId: WorkloadFocus;
-  colorByWorkload: Map<string, number> | null;
-  onNodeClick: (node: TopologyNode) => void;
-  onNodeHover: (node: TopologyNode | null) => void;
-  onFocusWorkload: (owner: WorkloadFocus) => void;
-  onSelectWorkload: (workload: AppWorkload) => void;
-  onNavigateToResource?: (resource: {
-    kind: string;
-    namespace: string;
-    name: string;
-    group?: string;
-  }) => void;
-  history?: AppHistory;
-  historyLoading?: boolean;
-  onOpenSource?: (source: AppSourceRef) => void;
-  renderOverviewIssues?: () => ReactNode;
+  app: AppRow
+  activeView: CanonicalApplicationView
+  onViewChange: (view: CanonicalApplicationView) => void
+  workloads: AppWorkload[]
+  ready: number
+  desired: number
+  versions: string[]
+  topology: Topology | null
+  topologyLoading?: boolean
+  deploymentLayer: DeploymentTopologyLayer | null
+  deploymentSource?: AppSourceRef
+  topologyAvailable: boolean
+  focusNodeId?: string
+  focusedOwnerId: WorkloadFocus
+  colorByWorkload: Map<string, number> | null
+  onNodeClick: (node: TopologyNode) => void
+  onNodeHover: (node: TopologyNode | null) => void
+  onFocusWorkload: (owner: WorkloadFocus) => void
+  onSelectWorkload: (workload: AppWorkload) => void
+  onNavigateToResource?: (resource: { kind: string; namespace: string; name: string; group?: string }) => void
+  history?: AppHistory
+  historyLoading?: boolean
+  onOpenSource?: (source: AppSourceRef) => void
+  onToggleReplicaSets: (ownerID: string) => void
+  renderOverviewIssues?: () => ReactNode
+  hasOverviewIssues?: boolean
 }) {
   const historyCount =
     (history?.anchors?.length ?? 0) +
@@ -700,9 +661,6 @@ function ApplicationWorkspace({
         <ApplicationOverview
           app={app}
           workloads={workloads}
-          namespace={namespace}
-          namespaces={namespaces}
-          verdictLabel={verdictLabel}
           ready={ready}
           desired={desired}
           versions={versions}
@@ -712,6 +670,7 @@ function ApplicationWorkspace({
           onSelectHistory={() => onViewChange("history")}
           onOpenSource={onOpenSource}
           renderOverviewIssues={renderOverviewIssues}
+          hasOverviewIssues={hasOverviewIssues}
         />
       )}
       {activeView === "topology" && (
@@ -727,6 +686,10 @@ function ApplicationWorkspace({
           onNodeHover={onNodeHover}
           onFocusWorkload={onFocusWorkload}
           onSelectWorkload={onSelectWorkload}
+          deploymentLayer={deploymentLayer}
+          deploymentSource={deploymentSource}
+          onOpenSource={onOpenSource}
+          onToggleReplicaSets={onToggleReplicaSets}
         />
       )}
       {activeView === "history" && (
@@ -804,9 +767,6 @@ type AppIssue = {
 function ApplicationOverview({
   app,
   workloads,
-  namespace,
-  namespaces,
-  verdictLabel,
   ready,
   desired,
   versions,
@@ -816,121 +776,106 @@ function ApplicationOverview({
   onSelectHistory,
   onOpenSource,
   renderOverviewIssues,
+  hasOverviewIssues,
 }: {
-  app: AppRow;
-  workloads: AppWorkload[];
-  namespace: string;
-  namespaces: string[];
-  verdictLabel: string;
-  ready: number;
-  desired: number;
-  versions: string[];
-  onSelectWorkload: (workload: AppWorkload) => void;
-  onNavigateToResource?: (resource: {
-    kind: string;
-    namespace: string;
-    name: string;
-    group?: string;
-  }) => void;
-  history?: AppHistory;
-  onSelectHistory: () => void;
-  onOpenSource?: (source: AppSourceRef) => void;
-  renderOverviewIssues?: () => ReactNode;
+  app: AppRow
+  workloads: AppWorkload[]
+  ready: number
+  desired: number
+  versions: string[]
+  onSelectWorkload: (workload: AppWorkload) => void
+  onNavigateToResource?: (resource: { kind: string; namespace: string; name: string; group?: string }) => void
+  history?: AppHistory
+  onSelectHistory: () => void
+  onOpenSource?: (source: AppSourceRef) => void
+  renderOverviewIssues?: () => ReactNode
+  hasOverviewIssues?: boolean
 }) {
-  const rel = app.relationships;
-  const hasEntrypoints = Boolean(
-    rel &&
-    ((rel.services?.length ?? 0) > 0 ||
-      (rel.ingresses?.length ?? 0) > 0 ||
-      (rel.routes?.length ?? 0) > 0),
-  );
-  const hasDependencies = Boolean(
-    rel &&
-    ((rel.configs ?? 0) > 0 ||
-      (rel.scalers ?? 0) > 0 ||
-      (rel.storage ?? 0) > 0 ||
-      (rel.pdbs ?? 0) > 0),
-  );
-  const classComposition = classCompositionOf(app)
+  const rel = app.relationships
+  const hasEntrypoints = Boolean(rel && (relationshipRefs(rel, 'service').length > 0 || relationshipRefs(rel, 'ingress').length > 0 || relationshipRefs(rel, 'route').length > 0))
+  const hasDependencies = Boolean(rel && (
+    relationshipRefs(rel, 'config').length > 0 ||
+    relationshipRefs(rel, 'scaler').length > 0 ||
+    relationshipRefs(rel, 'storage').length > 0 ||
+    relationshipRefs(rel, 'pdb').length > 0 ||
+    relationshipRefs(rel, 'networkPolicy').length > 0
+  ))
+  const composition = classCompositionOf(app)
     .map(({ cls, count }) => `${count} ${cls}`)
-    .join(" / ");
-  const workloadComposition = workloadKindComposition(workloads);
-  const batchActivity = useMemo(() => batchActivityForApp(app), [app]);
-  const batchStats = batchOverviewStats(batchActivity);
-  const pureBatch = workloadClassOf(app.workload_class) === "job";
-  const renderedOverviewIssues = renderOverviewIssues ? (
-    renderOverviewIssues()
-  ) : (
-    <ApplicationNow
-      issues={buildAppIssues(workloads, app.events ?? [])}
-      ready={ready}
-      desired={desired}
-      onSelectWorkload={onSelectWorkload}
-    />
-  );
+    .join(' / ')
+  const issues = useMemo(() => buildAppIssues(workloads, app.events ?? []), [workloads, app.events])
+  const currentIssuesPresent = renderOverviewIssues
+    ? hasOverviewIssues ?? issues.length > 0
+    : issues.length > 0
+  const batchActivity = useMemo(() => batchActivityForApp(app), [app])
+  const batchStats = batchOverviewStats(batchActivity)
+  const pureBatch = workloadClassOf(app.workload_class) === 'job'
+  const workloadComposition = workloadKindComposition(workloads)
+  const latestChange = history?.summary?.state === 'change' ? history.summary : undefined
+  const runtimeHealth = healthOf(app.runtimeHealth ?? worstHealth(workloads.map((workload) => workload.health)))
+  const hasDeliveryStatus = Boolean(app.sourceStatus?.sync || app.sourceStatus?.health)
+  const extraFactCount = Number(Boolean(latestChange)) + Number(hasDeliveryStatus)
+  const factGrid = pureBatch
+    ? extraFactCount === 2
+      ? '2xl:grid-cols-6'
+      : extraFactCount === 1
+        ? '2xl:grid-cols-5'
+        : '2xl:grid-cols-4'
+    : extraFactCount === 2
+      ? '2xl:grid-cols-5'
+      : extraFactCount === 1
+        ? '2xl:grid-cols-4'
+        : '2xl:grid-cols-3'
 
   return (
     <div className="min-h-0 flex-1 overflow-auto">
       <div className="grid w-full max-w-[2400px] gap-4 p-4 sm:p-6 xl:grid-cols-[minmax(0,1fr)_minmax(320px,380px)]">
         <div className="min-w-0 space-y-4">
-          {renderedOverviewIssues}
+          {renderOverviewIssues ? renderOverviewIssues() : <ApplicationNow issues={issues} onSelectWorkload={onSelectWorkload} />}
           <ApplicationLatestHistory
             history={history}
             sourceRef={app.sourceRef}
+            showIncidentPreview={!currentIssuesPresent}
             onSelectHistory={onSelectHistory}
             onOpenSource={onOpenSource}
           />
-          <div className="grid gap-3 md:grid-cols-2 2xl:grid-cols-4">
-            <ApplicationFact label="State" value={verdictLabel} />
+          <div className={clsx('grid gap-3 md:grid-cols-2', factGrid)}>
+            <ApplicationFact
+              label="Runtime"
+              value={pureBatch ? batchRuntimeForApp(app).label : HEALTH_META[runtimeHealth].label}
+              detail={pureBatch ? batchStats.activeDetail : desired > 0 ? `${ready}/${desired} ready` : 'No desired replicas'}
+            />
+            {hasDeliveryStatus && (
+              <ApplicationFact
+                label="Delivery"
+                value={<SourceDeliveryStatus status={app.sourceStatus!} />}
+                detail={app.sourceRef ? sourceObjectLabel(app.sourceRef) : undefined}
+              />
+            )}
             {pureBatch ? (
               <>
-                <ApplicationFact
-                  label="Batch resources"
-                  value={String(workloads.length)}
-                  detail={workloadComposition || "No workloads"}
-                />
-                <ApplicationFact
-                  label="Active runs"
-                  value={batchStats.activeValue}
-                  detail={batchStats.activeDetail}
-                />
-                <ApplicationFact
-                  label="Retained runs"
-                  value={batchStats.retainedValue}
-                  detail="Kubernetes-retained history"
-                />
+                <ApplicationFact label="Batch resources" value={String(workloads.length)} detail={workloadComposition || 'No workloads'} />
+                <ApplicationFact label="Active runs" value={batchStats.activeValue} detail={batchStats.activeDetail} />
+                <ApplicationFact label="Retained runs" value={batchStats.retainedValue} detail="Kubernetes-retained history" />
               </>
             ) : (
               <>
-                <ApplicationFact
-                  label="Workloads"
-                  value={String(workloads.length)}
-                  detail={workloadComposition || "No workloads"}
-                />
-                <ApplicationFact
-                  label="Ready"
-                  value={`${ready}/${desired}`}
-                  detail={desired === 0 ? "No serving replicas" : undefined}
-                />
-                <ApplicationFact
-                  label="Version"
-                  value={
-                    app.appVersion ||
-                    (versions.length === 1
-                      ? versions[0]
-                      : versions.length > 1
-                        ? `${versions.length} versions`
-                        : "Unknown")
-                  }
-                />
+                <ApplicationFact label="Workloads" value={String(workloads.length)} detail={composition || 'No workloads'} />
+                <ApplicationFact label="Version" value={app.appVersion || (versions.length === 1 ? versions[0] : versions.length > 1 ? `${versions.length} versions` : 'Unknown')} />
               </>
+            )}
+            {latestChange && (
+              <ApplicationLatestChangeFact
+                summary={latestChange}
+                sourceRef={app.sourceRef ? undefined : history?.sourceRef}
+                onSelectHistory={onSelectHistory}
+                onOpenSource={onOpenSource}
+              />
             )}
           </div>
           {hasEntrypoints && (
             <ApplicationEntrypoints
               relationships={rel}
-              namespace={namespace}
-              namespaces={namespaces}
               onNavigateToResource={onNavigateToResource}
             />
           )}
@@ -942,15 +887,9 @@ function ApplicationOverview({
           </ApplicationPanel>
           {!pureBatch && <ApplicationBatchOverview activity={batchActivity} />}
         </div>
-        <aside className="min-w-0 space-y-4">
-          <ApplicationSourceProvenance
-            app={app}
-            namespace={namespace}
-            namespaces={namespaces}
-            composition={classComposition}
-            onOpenSource={onOpenSource}
-          />
-          {hasDependencies && <ApplicationDependencies relationships={rel} />}
+        <aside className={clsx('min-w-0 gap-4 xl:block xl:space-y-4', hasDependencies ? 'grid md:grid-cols-2' : 'max-w-xl xl:max-w-none')}>
+          <ApplicationSourceProvenance app={app} onOpenSource={onOpenSource} />
+          {hasDependencies && <ApplicationDependencies relationships={rel} onNavigateToResource={onNavigateToResource} />}
         </aside>
       </div>
     </div>
@@ -974,69 +913,75 @@ function workloadKindComposition(workloads: AppWorkload[]): string {
 
 function ApplicationSourceProvenance({
   app,
-  namespace,
-  namespaces,
-  composition,
   onOpenSource,
 }: {
-  app: AppRow;
-  namespace: string;
-  namespaces: string[];
-  composition: string;
-  onOpenSource?: (source: AppSourceRef) => void;
+  app: AppRow
+  onOpenSource?: (source: AppSourceRef) => void
 }) {
-  const source = app.identity?.source
-    ? appSourceLabel(app.identity.source)
-    : app.tier
-      ? overlayProvenance(app.tier)
-      : "raw workload";
-  const confidence = app.confidence || (app.tier ? "low" : "raw");
+  if (app.sourceRef) {
+    const sourceName = `${app.sourceRef.namespace}/${app.sourceRef.name}`
+    return (
+      <ApplicationPanel title="Deployment source">
+        <div className="space-y-3">
+          <div>
+            <div className="text-xs font-semibold uppercase text-theme-text-tertiary">{sourceObjectLabel(app.sourceRef)}</div>
+            <Tooltip content={sourceName} delay={150}>
+              <div className="mt-1 truncate font-mono text-sm font-medium text-theme-text-primary">{sourceName}</div>
+            </Tooltip>
+          </div>
+          {app.sourceStatus && <SourceDeliveryStatus status={app.sourceStatus} />}
+          {onOpenSource && (
+            <button
+              type="button"
+              onClick={() => onOpenSource(app.sourceRef!)}
+              className="inline-flex w-fit items-center gap-1.5 rounded-md px-2.5 py-1.5 text-sm font-medium text-accent-text hover:bg-theme-hover"
+            >
+              <ExternalLink className="h-3.5 w-3.5" aria-hidden />
+              {sourceLinkLabel(app.sourceRef)}
+            </button>
+          )}
+        </div>
+      </ApplicationPanel>
+    )
+  }
+
+  if (app.sourceConflict) {
+    return (
+      <ApplicationPanel title="Deployment source">
+        <div className="space-y-2">
+          <div className="flex items-center gap-2">
+            <AlertTriangle className="h-4 w-4 shrink-0 text-amber-500" aria-hidden />
+            <span className="text-sm font-semibold text-theme-text-primary">Multiple deployment sources detected</span>
+          </div>
+          <p className="text-sm text-theme-text-secondary">Workloads in this application do not share one deployment manager.</p>
+        </div>
+      </ApplicationPanel>
+    )
+  }
+
+  const inferred = app.identity?.confidence === 'medium'
+  const identityLabel = app.identity?.source ? appSourceLabel(app.identity.source) : undefined
+  const tierLabel = !app.identity && app.tier ? overlayProvenance(app.tier) : undefined
   return (
     <ApplicationPanel title="Application identity">
-      <div className="grid gap-3">
-        <ApplicationFact
-          variant="row"
-          label="Grouped by"
-          value={source}
-          detail={app.identity?.evidence ?? app.key}
-          monoDetail
-        />
-        <ApplicationFact
-          variant="row"
-          label="App key"
-          value={app.name}
-          detail={app.key}
-          monoDetail
-        />
-        <ApplicationFact
-          variant="row"
-          label={namespaces.length > 1 ? "Namespaces" : "Namespace"}
-          value={namespace || `${namespaces.length} namespaces`}
-          detail={namespaces.length > 1 ? namespaces.join(", ") : undefined}
-          monoDetail
-        />
-        <div className="grid grid-cols-2 gap-4 border-t border-theme-border pt-3">
-          <ApplicationFact
-            variant="bare"
-            label="Confidence"
-            value={confidence}
-          />
-          <ApplicationFact
-            variant="bare"
-            label="Class"
-            value={workloadClassOf(app.workload_class)}
-            detail={composition || undefined}
-          />
+      <div className="space-y-2">
+        <div className="flex items-center gap-2">
+          {inferred && <AlertTriangle className="h-4 w-4 shrink-0 text-amber-500" aria-hidden />}
+          <span className="text-sm font-semibold text-theme-text-primary">
+            {identityLabel
+              ? inferred
+                ? 'Inferred application boundary'
+                : `Identified by ${identityLabel}`
+              : tierLabel
+                ? `Grouped by ${tierLabel} metadata`
+                : 'Grouped from Kubernetes ownership'}
+          </span>
         </div>
-        {app.sourceRef && onOpenSource && (
-          <button
-            type="button"
-            onClick={() => onOpenSource(app.sourceRef!)}
-            className="inline-flex w-fit items-center gap-1.5 rounded-md px-2.5 py-1.5 text-sm font-medium text-accent-text hover:bg-theme-hover"
-          >
-            <ExternalLink className="h-3.5 w-3.5" aria-hidden />
-            {sourceLinkLabel(app.sourceRef)}
-          </button>
+        {inferred && identityLabel && <p className="text-sm text-theme-text-secondary">Matched using {identityLabel}.</p>}
+        {app.identity?.evidence && (
+          <Tooltip content={app.identity.evidence} delay={150}>
+            <div className="truncate font-mono text-xs text-theme-text-tertiary">{app.identity.evidence}</div>
+          </Tooltip>
         )}
       </div>
     </ApplicationPanel>
@@ -1045,25 +990,19 @@ function ApplicationSourceProvenance({
 
 function ApplicationEntrypoints({
   relationships,
-  namespace,
-  namespaces,
   onNavigateToResource,
 }: {
-  relationships: AppRow["relationships"];
-  namespace: string;
-  namespaces: string[];
-  onNavigateToResource?: (resource: {
-    kind: string;
-    namespace: string;
-    name: string;
-    group?: string;
-  }) => void;
+  relationships: AppRow['relationships']
+  onNavigateToResource?: (resource: { kind: string; namespace: string; name: string; group?: string }) => void
 }) {
-  const serviceCount = relationships?.services?.length ?? 0;
-  const ingressCount = relationships?.ingresses?.length ?? 0;
-  const routeCount = relationships?.routes?.length ?? 0;
-  const hasExternal = ingressCount + routeCount > 0;
-  if (serviceCount + ingressCount + routeCount === 0) return null;
+  const serviceRefs = relationshipRefs(relationships, 'service')
+  const ingressRefs = relationshipRefs(relationships, 'ingress')
+  const routeRefs = relationshipRefs(relationships, 'route')
+  const serviceCount = serviceRefs.length
+  const ingressCount = ingressRefs.length
+  const routeCount = routeRefs.length
+  const hasExternal = ingressCount + routeCount > 0
+  if (serviceCount + ingressCount + routeCount === 0) return null
 
   return (
     <ApplicationPanel title="Entrypoints">
@@ -1107,27 +1046,15 @@ function ApplicationEntrypoints({
         <div className="space-y-3 border-t border-theme-border pt-3">
           <ApplicationRelatedNameGroup
             label="Services"
-            kind="Service"
-            names={relationships?.services}
-            namespace={namespace}
-            namespaces={namespaces}
+            refs={serviceRefs}
             onNavigateToResource={onNavigateToResource}
           />
           <ApplicationRelatedNameGroup
             label="Ingresses"
-            kind="Ingress"
-            names={relationships?.ingresses}
-            namespace={namespace}
-            namespaces={namespaces}
+            refs={ingressRefs}
             onNavigateToResource={onNavigateToResource}
           />
-          <ApplicationRelatedNameGroup
-            label="Routes"
-            kind="Route"
-            names={relationships?.routes}
-            namespace={namespace}
-            namespaces={namespaces}
-          />
+          <ApplicationRelatedNameGroup label="Routes" refs={routeRefs} onNavigateToResource={onNavigateToResource} />
         </div>
       </div>
     </ApplicationPanel>
@@ -1136,38 +1063,26 @@ function ApplicationEntrypoints({
 
 function ApplicationDependencies({
   relationships,
+  onNavigateToResource,
 }: {
-  relationships: AppRow["relationships"];
+  relationships: AppRow['relationships']
+  onNavigateToResource?: (resource: { kind: string; namespace: string; name: string; group?: string }) => void
 }) {
-  const configCount = relationships?.configs ?? 0;
-  const scalerCount = relationships?.scalers ?? 0;
-  const storageCount = relationships?.storage ?? 0;
-  const pdbCount = relationships?.pdbs ?? 0;
-  if (configCount + scalerCount + storageCount + pdbCount === 0) return null;
+  const configs = relationshipRefs(relationships, 'config')
+  const scalers = relationshipRefs(relationships, 'scaler')
+  const storage = relationshipRefs(relationships, 'storage')
+  const pdbs = relationshipRefs(relationships, 'pdb')
+  const networkPolicies = relationshipRefs(relationships, 'networkPolicy')
+  if (configs.length + scalers.length + storage.length + pdbs.length + networkPolicies.length === 0) return null
 
   return (
     <ApplicationPanel title="Dependencies">
       <div className="space-y-3">
-        <ApplicationDependencyRow
-          label="Configuration"
-          count={configCount}
-          detail="ConfigMaps and Secrets referenced by app workloads."
-        />
-        <ApplicationDependencyRow
-          label="Autoscaling"
-          count={scalerCount}
-          detail="Autoscalers controlling app workloads."
-        />
-        <ApplicationDependencyRow
-          label="Storage"
-          count={storageCount}
-          detail="PersistentVolumeClaims mounted by app workloads."
-        />
-        <ApplicationDependencyRow
-          label="Availability policy"
-          count={pdbCount}
-          detail="PodDisruptionBudgets protecting app workloads."
-        />
+        <ApplicationDependencyRow label="Configuration" refs={configs} totalCount={relationships?.configs} detail="ConfigMaps and Secrets referenced by app workloads." onNavigateToResource={onNavigateToResource} />
+        <ApplicationDependencyRow label="Autoscaling" refs={scalers} totalCount={relationships?.scalers} detail="Autoscalers controlling app workloads." onNavigateToResource={onNavigateToResource} />
+        <ApplicationDependencyRow label="Storage" refs={storage} totalCount={relationships?.storage} detail="PersistentVolumeClaims mounted by app workloads." onNavigateToResource={onNavigateToResource} />
+        <ApplicationDependencyRow label="Availability policy" refs={pdbs} totalCount={relationships?.pdbs} detail="PodDisruptionBudgets protecting app workloads." onNavigateToResource={onNavigateToResource} />
+        <ApplicationDependencyRow label="Network policy" refs={networkPolicies} totalCount={relationships?.networkPolicies} detail="Network policies selecting app workloads." onNavigateToResource={onNavigateToResource} />
       </div>
     </ApplicationPanel>
   );
@@ -1175,14 +1090,19 @@ function ApplicationDependencies({
 
 function ApplicationDependencyRow({
   label,
-  count,
+  refs,
+  totalCount,
   detail,
+  onNavigateToResource,
 }: {
-  label: string;
-  count: number;
-  detail: string;
+  label: string
+  refs: ResourceRef[]
+  totalCount?: number
+  detail: string
+  onNavigateToResource?: (resource: { kind: string; namespace: string; name: string; group?: string }) => void
 }) {
-  if (!count) return null;
+  if (refs.length === 0) return null
+  const count = Math.max(totalCount ?? refs.length, refs.length)
   return (
     <div className="min-w-0 border-b border-theme-border pb-3 last:border-b-0">
       <div className="flex items-baseline justify-between gap-3">
@@ -1194,135 +1114,78 @@ function ApplicationDependencyRow({
         </span>
       </div>
       <div className="mt-1 text-xs text-theme-text-tertiary">{detail}</div>
+      <ApplicationRelatedNameGroup label={label} refs={refs} totalCount={count} onNavigateToResource={onNavigateToResource} hideLabel />
     </div>
   );
 }
 
 function ApplicationRelatedNameGroup({
   label,
-  kind,
-  names,
-  namespace,
-  namespaces,
+  refs,
+  totalCount,
   onNavigateToResource,
+  hideLabel,
 }: {
-  label: string;
-  kind: string;
-  names?: string[];
-  namespace: string;
-  namespaces: string[];
-  onNavigateToResource?: (resource: {
-    kind: string;
-    namespace: string;
-    name: string;
-    group?: string;
-  }) => void;
+  label: string
+  refs?: ResourceRef[]
+  totalCount?: number
+  onNavigateToResource?: (resource: { kind: string; namespace: string; name: string; group?: string }) => void
+  hideLabel?: boolean
 }) {
-  if (!names || names.length === 0) return null;
+  if (!refs || refs.length === 0) return null
 
-  // Routes are polymorphic — the backend ships "Kind/name" (e.g. HTTPRoute/web).
-  // Split so the real kind drives the chip label and navigation, not the literal
-  // "Route" (which rendered "Route/HTTPRoute/web" and never resolved).
-  const refs: ResourceRef[] = names.map((name) => {
-    if (kind === "Route") {
-      const slash = name.indexOf("/");
-      if (slash > 0)
-        return {
-          kind: name.slice(0, slash),
-          namespace,
-          name: name.slice(slash + 1),
-        };
-    }
-    return { kind, namespace, name };
-  });
-  const baseNav = Boolean(
-    onNavigateToResource && namespace && namespaces.length <= 1,
-  );
-  const visible = refs.slice(0, 12);
-  const overflow = Math.max(0, refs.length - visible.length);
+  const visible = refs.slice(0, 12)
+  const count = Math.max(totalCount ?? refs.length, refs.length)
+  const overflow = Math.max(0, count - visible.length)
   return (
-    <div>
-      <div className="mb-1 text-xs font-medium text-theme-text-tertiary">
-        {label}
-        {refs.length > 1 ? ` (${refs.length})` : ""}
-      </div>
+    <div className={hideLabel ? 'mt-2' : undefined}>
+      {!hideLabel && <div className="mb-1 text-xs font-medium text-theme-text-tertiary">{label}{count > 1 ? ` (${count})` : ''}</div>}
       <div className="flex flex-wrap gap-1.5">
-        {visible.map((ref) =>
-          baseNav && ref.kind !== "Route" ? (
-            <ResourceRefBadge
-              key={`${ref.kind}/${ref.namespace}/${ref.name}`}
-              resourceRef={ref}
-              onClick={(clicked) =>
-                onNavigateToResource?.(refToSelectedResource(clicked))
-              }
-            />
-          ) : (
-            <ApplicationRelatedChip
-              key={`${ref.kind}/${ref.name}`}
-              kind={ref.kind}
-              name={ref.name}
-            />
-          ),
-        )}
-        {overflow > 0 && (
-          <span className={`${CHIP} ${CHIP_TONE.muted}`}>+{overflow} more</span>
-        )}
+        {visible.map((ref) => (
+          <ResourceRefBadge
+            key={`${ref.group || ''}/${ref.kind}/${ref.namespace}/${ref.name}`}
+            resourceRef={ref}
+            onClick={onNavigateToResource ? (clicked) => onNavigateToResource(refToSelectedResource(clicked)) : undefined}
+          />
+        ))}
+        {overflow > 0 && <span className={`${CHIP} ${CHIP_TONE.muted}`}>+{overflow} more</span>}
       </div>
     </div>
   );
 }
 
-function ApplicationRelatedChip({
-  kind,
-  name,
-}: {
-  kind: string;
-  name: string;
-}) {
-  return (
-    <Tooltip content={`${kind}: ${name}`} delay={300}>
-      <span className={`${CHIP} ${CHIP_TONE.muted}`}>
-        <span className="opacity-70">{kind}/</span>
-        {midTruncate(name, 28)}
-      </span>
-    </Tooltip>
-  );
+type RelationshipGroup = 'service' | 'ingress' | 'route' | 'config' | 'scaler' | 'storage' | 'pdb' | 'networkPolicy'
+
+function relationshipRefs(relationships: AppRow['relationships'] | undefined, group: RelationshipGroup): ResourceRef[] {
+  if (!relationships) return []
+  switch (group) {
+    case 'service':
+      return relationships.serviceRefs ?? []
+    case 'ingress':
+      return relationships.ingressRefs ?? []
+    case 'route':
+      return relationships.routeRefs ?? []
+    case 'config':
+      return relationships.configRefs ?? []
+    case 'scaler':
+      return relationships.scalerRefs ?? []
+    case 'storage':
+      return relationships.storageRefs ?? []
+    case 'pdb':
+      return relationships.pdbRefs ?? []
+    case 'networkPolicy':
+      return relationships.networkPolicyRefs ?? []
+  }
 }
 
 function ApplicationNow({
   issues,
-  ready,
-  desired,
   onSelectWorkload,
 }: {
-  issues: AppIssue[];
-  ready: number;
-  desired: number;
-  onSelectWorkload: (workload: AppWorkload) => void;
+  issues: AppIssue[]
+  onSelectWorkload: (workload: AppWorkload) => void
 }) {
-  if (issues.length === 0) {
-    return (
-      <section className="rounded-lg border border-theme-border bg-theme-surface px-4 py-3 shadow-theme-sm">
-        <div className="flex flex-wrap items-center gap-3">
-          <span
-            className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-md ring-1 ring-inset ${CHIP_TONE.emerald}`}
-          >
-            <CheckCircle2 className="h-4 w-4" aria-hidden />
-          </span>
-          <div className="min-w-0 flex-1">
-            <h2 className="text-sm font-semibold text-theme-text-primary">
-              No application issues detected
-            </h2>
-            <p className="mt-0.5 text-sm text-theme-text-secondary">
-              {desired === 0
-                ? "No desired workload replicas are currently expected."
-                : `${ready}/${desired} workload replicas are ready.`}
-            </p>
-          </div>
-        </div>
-      </section>
-    );
-  }
+  if (issues.length === 0) return null
 
   const top = issues[0];
   return (
@@ -1531,32 +1394,32 @@ function relativeTime(value: string): string {
 function ApplicationLatestHistory({
   history,
   sourceRef,
+  showIncidentPreview,
   onSelectHistory,
   onOpenSource,
 }: {
-  history?: AppHistory;
-  sourceRef?: AppSourceRef;
-  onSelectHistory: () => void;
-  onOpenSource?: (source: AppSourceRef) => void;
+  history?: AppHistory
+  sourceRef?: AppSourceRef
+  showIncidentPreview?: boolean
+  onSelectHistory: () => void
+  onOpenSource?: (source: AppSourceRef) => void
 }) {
-  const summary = history?.summary;
-  if (!summary || summary.state !== "change") return null;
-  const resolvedSource = sourceRef ?? history?.sourceRef;
+  const summary = history?.summary
+  const showIncident = summary?.state === 'incident' && showIncidentPreview
+  if (!summary || !showIncident) return null
+  const resolvedSource = sourceRef ?? history?.sourceRef
+  const tone = CHIP_TONE.amber
 
   return (
     <section className="rounded-lg border border-theme-border bg-theme-surface px-4 py-3 shadow-theme-sm">
       <div className="flex flex-wrap items-start gap-3">
-        <span
-          className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-md ring-1 ring-inset ${CHIP_TONE.blue}`}
-        >
-          <Clock3 className="h-4 w-4" aria-hidden />
+        <span className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-md ring-1 ring-inset ${tone}`}>
+          <AlertTriangle className="h-4 w-4" aria-hidden />
         </span>
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
-            <h2 className="text-sm font-semibold text-theme-text-primary">
-              {summary.title}
-            </h2>
-            <span className={`${CHIP} ${CHIP_TONE.blue}`}>Latest change</span>
+            <h2 className="text-sm font-semibold text-theme-text-primary">{summary.title}</h2>
+            <span className={`${CHIP} ${tone}`}>Latest incident</span>
           </div>
           {summary.detail && (
             <p className="mt-0.5 line-clamp-2 text-sm text-theme-text-secondary">
@@ -1570,12 +1433,8 @@ function ApplicationLatestHistory({
           )}
         </div>
         <div className="flex shrink-0 items-center gap-2">
-          {resolvedSource && onOpenSource && (
-            <button
-              type="button"
-              onClick={() => onOpenSource(resolvedSource)}
-              className="rounded-md px-2.5 py-1.5 text-sm font-medium text-accent-text hover:bg-theme-hover"
-            >
+          {resolvedSource && !sourceRef && onOpenSource && (
+            <button type="button" onClick={() => onOpenSource(resolvedSource)} className="rounded-md px-2.5 py-1.5 text-sm font-medium text-accent-text hover:bg-theme-hover">
               {sourceLinkLabel(resolvedSource)}
             </button>
           )}
@@ -1592,13 +1451,35 @@ function ApplicationLatestHistory({
   );
 }
 
-function WorkloadsMatrix({
-  workloads,
-  onSelectWorkload,
+function ApplicationLatestChangeFact({
+  summary,
+  sourceRef,
+  onSelectHistory,
+  onOpenSource,
 }: {
-  workloads: AppWorkload[];
-  onSelectWorkload: (workload: AppWorkload) => void;
+  summary: NonNullable<AppHistory['summary']>
+  sourceRef?: AppSourceRef
+  onSelectHistory: () => void
+  onOpenSource?: (source: AppSourceRef) => void
 }) {
+  return (
+    <div className="min-w-0 rounded-lg border border-theme-border bg-theme-surface px-4 py-3 shadow-theme-sm md:col-span-2 2xl:col-span-1">
+      <div className="flex items-center justify-between gap-2">
+        <div className="text-[10px] font-semibold uppercase tracking-wide text-theme-text-tertiary">Latest change</div>
+        <button type="button" onClick={onSelectHistory} className="shrink-0 text-xs font-medium text-accent-text hover:underline">History</button>
+      </div>
+      <div className="mt-1 truncate text-sm font-semibold text-theme-text-primary">{summary.title}</div>
+      {summary.detail && <div className="mt-0.5 truncate font-mono text-xs text-theme-text-tertiary">{summary.detail}</div>}
+      {sourceRef && onOpenSource && (
+        <button type="button" onClick={() => onOpenSource(sourceRef)} className="mt-1 text-xs font-medium text-accent-text hover:underline">
+          {sourceLinkLabel(sourceRef)}
+        </button>
+      )}
+    </div>
+  )
+}
+
+function WorkloadsMatrix({ workloads, onSelectWorkload }: { workloads: AppWorkload[]; onSelectWorkload: (workload: AppWorkload) => void }) {
   if (workloads.length === 0) {
     return <EmptyState variant="inline" headline="No inspectable workloads." />;
   }
@@ -1618,7 +1499,8 @@ function WorkloadsMatrix({
         </thead>
         <tbody>
           {workloads.map((w) => {
-            const status = workloadRuntimeStatus(w);
+            const status = workloadRuntimeStatus(w)
+            const reason = w.reason === 'Completed' && w.kind !== 'Job' ? undefined : w.reason
             return (
               <tr
                 key={workloadKey(w)}
@@ -1632,18 +1514,10 @@ function WorkloadsMatrix({
                   >
                     {w.name}
                   </button>
-                  {w.reason && (
-                    <div className="truncate text-xs text-theme-text-tertiary">
-                      {w.reason}
-                    </div>
-                  )}
+                  {reason && <div className="truncate text-xs text-theme-text-tertiary">{reason}</div>}
                 </td>
-                <td className="px-2 py-2 text-theme-text-secondary">
-                  {w.kind}
-                </td>
-                <td className="px-2 py-2 text-theme-text-secondary">
-                  {workloadClassOf(w.workload_class)}
-                </td>
+                <td className="px-2 py-2 text-theme-text-secondary">{w.kind}</td>
+                <td className="px-2 py-2 text-theme-text-secondary">{workloadClassOf(w.workload_class)}</td>
                 <td className="px-2 py-2">
                   <span className="inline-flex items-center gap-1.5 text-theme-text-secondary">
                     <StatusDot tone={mapHealthToTone(status.health)} />
@@ -1709,25 +1583,33 @@ function ApplicationTopology({
   onNodeHover,
   onFocusWorkload,
   onSelectWorkload,
+  deploymentLayer,
+  deploymentSource,
+  onOpenSource,
+  onToggleReplicaSets,
 }: {
-  topology: Topology | null;
-  loading?: boolean;
-  available: boolean;
-  workloads: AppWorkload[];
-  colorByWorkload: Map<string, number> | null;
-  focusNodeId?: string;
-  focusedOwnerId: WorkloadFocus;
-  onNodeClick: (node: TopologyNode) => void;
-  onNodeHover: (node: TopologyNode | null) => void;
-  onFocusWorkload: (owner: WorkloadFocus) => void;
-  onSelectWorkload: (workload: AppWorkload) => void;
+  topology: Topology | null
+  loading?: boolean
+  available: boolean
+  workloads: AppWorkload[]
+  colorByWorkload: Map<string, number> | null
+  focusNodeId?: string
+  focusedOwnerId: WorkloadFocus
+  onNodeClick: (node: TopologyNode) => void
+  onNodeHover: (node: TopologyNode | null) => void
+  onFocusWorkload: (owner: WorkloadFocus) => void
+  onSelectWorkload: (workload: AppWorkload) => void
+  deploymentLayer: DeploymentTopologyLayer | null
+  deploymentSource?: AppSourceRef
+  onOpenSource?: (source: AppSourceRef) => void
+  onToggleReplicaSets: (ownerID: string) => void
 }) {
   const hasSharedOrUnscopedNodes = useMemo(
-    () =>
-      topology?.nodes.some((node) => {
-        const stamp = ownershipOf(node.data);
-        return !stamp.ownerWorkloadId && stamp.focusWorkloadIds.length !== 1;
-      }) ?? false,
+    () => topology?.nodes.some((node) => {
+      if (node.data?.deploymentMembership === 'source-only') return false
+      const stamp = ownershipOf(node.data)
+      return !stamp.ownerWorkloadId && stamp.focusWorkloadIds.length !== 1
+    }) ?? false,
     [topology],
   );
 
@@ -1745,6 +1627,8 @@ function ApplicationTopology({
             focusNodeId={focusNodeId}
             focusedOwnerId={focusedOwnerId}
             onNodeHover={onNodeHover}
+            onToggleReplicaSets={onToggleReplicaSets}
+            fitViewPadding={{ top: 0.08, right: 0.05, bottom: 0.08, left: '360px' }}
           />
           <TopologyWorkloadLegend
             workloads={workloads}
@@ -1753,6 +1637,9 @@ function ApplicationTopology({
             showSharedOrUnscoped={hasSharedOrUnscopedNodes}
             onFocus={onFocusWorkload}
             onSelectWorkload={onSelectWorkload}
+            deploymentLayer={deploymentLayer}
+            deploymentSource={deploymentSource}
+            onOpenSource={onOpenSource}
           />
         </>
       ) : loading ? (
@@ -2081,8 +1968,41 @@ function historyStatusTone(status: string): string {
 }
 
 function sourceLinkLabel(source: AppSourceRef): string {
-  if (source.type === "helm") return "View Helm release";
-  return "View GitOps source";
+  return `View ${sourceObjectLabel(source)}`
+}
+
+function sourceObjectLabel(source: AppSourceRef): string {
+  if (source.type === 'helm') return 'Helm release'
+  if (source.tool === 'argocd' || source.kind.toLowerCase() === 'application') return 'Argo CD application'
+  if (source.kind.toLowerCase() === 'helmrelease') return 'Flux HelmRelease'
+  if (source.kind.toLowerCase() === 'kustomization') return 'Flux Kustomization'
+  return 'GitOps source'
+}
+
+function sourceInventoryLabel(source: AppSourceRef): string {
+  if (source.type === 'helm') return 'Helm'
+  if (source.tool === 'argocd' || source.kind.toLowerCase() === 'application') return 'Argo CD'
+  if (source.tool === 'fluxcd') return 'Flux'
+  return 'GitOps'
+}
+
+function SourceDeliveryStatus({ status }: { status: NonNullable<AppRow['sourceStatus']> }) {
+  const values = [
+    status.sync ? { label: status.sync, tone: sourceSyncHealth(status.sync) } : null,
+    status.health ? { label: status.health, tone: sourceReportedHealth(status.health) } : null,
+  ].filter((value): value is { label: string; tone: AppHealth } => value !== null)
+
+  return (
+    <span className="inline-flex min-w-0 items-center gap-2">
+      {values.map((value, index) => (
+        <span key={`${value.label}-${index}`} className="inline-flex min-w-0 items-center gap-1.5">
+          {index > 0 && <span className="text-theme-text-tertiary" aria-hidden>·</span>}
+          <StatusDot tone={mapHealthToTone(value.tone)} />
+          <span className="truncate">{value.label}</span>
+        </span>
+      ))}
+    </span>
+  )
 }
 
 function formatAppEventTime(value?: string): string {
@@ -2115,12 +2035,12 @@ function ApplicationFact({
   monoDetail,
   variant = "card",
 }: {
-  label: string;
-  value: string;
-  detail?: string;
-  monoValue?: boolean;
-  monoDetail?: boolean;
-  variant?: "card" | "row" | "bare";
+  label: string
+  value: ReactNode
+  detail?: string
+  monoValue?: boolean
+  monoDetail?: boolean
+  variant?: 'card' | 'row' | 'bare'
 }) {
   if (variant === "row") {
     return (
@@ -2363,16 +2283,27 @@ function TopologyWorkloadLegend({
   showSharedOrUnscoped,
   onFocus,
   onSelectWorkload,
+  deploymentLayer,
+  deploymentSource,
+  onOpenSource,
 }: {
-  workloads: AppWorkload[];
-  colorByWorkload: Map<string, number> | null;
-  focusedOwnerId: WorkloadFocus;
-  showSharedOrUnscoped: boolean;
-  onFocus: (owner: WorkloadFocus) => void;
-  onSelectWorkload: (workload: AppWorkload) => void;
+  workloads: AppWorkload[]
+  colorByWorkload: Map<string, number> | null
+  focusedOwnerId: WorkloadFocus
+  showSharedOrUnscoped: boolean
+  onFocus: (owner: WorkloadFocus) => void
+  onSelectWorkload: (workload: AppWorkload) => void
+  deploymentLayer: DeploymentTopologyLayer | null
+  deploymentSource?: AppSourceRef
+  onOpenSource?: (source: AppSourceRef) => void
 }) {
+  const managedOnlyCount = deploymentLayer?.managedOnly.length ?? 0
+  const runtimeOnlyCount = deploymentLayer?.runtimeOnlyCount ?? 0
+  const showSourceDifferences = !!deploymentSource && managedOnlyCount + runtimeOnlyCount > 0
+  const sourceLabel = deploymentSource ? sourceInventoryLabel(deploymentSource) : ''
+
   return (
-    <div className="absolute left-4 top-4 z-10 w-[min(22rem,calc(100%-2rem))] overflow-hidden rounded-lg border border-theme-border bg-theme-surface/95 shadow-theme-md backdrop-blur">
+    <div className="absolute left-4 top-4 z-10 w-[min(18.5rem,calc(100%-2rem))] 2xl:w-[min(22rem,calc(100%-2rem))] overflow-hidden rounded-lg border border-theme-border bg-theme-surface/95 shadow-theme-md backdrop-blur">
       <div className="flex items-center justify-between gap-3 border-b border-theme-border bg-theme-base px-3 py-2">
         <span className="text-xs font-semibold text-theme-text-primary">
           Workloads
@@ -2414,8 +2345,46 @@ function TopologyWorkloadLegend({
           />
         )}
       </div>
+      {showSourceDifferences && deploymentSource && (
+        <div className="border-t border-theme-border px-3 py-2.5">
+          <div className="mb-1.5 text-[10px] font-semibold uppercase tracking-wide text-theme-text-tertiary">Source differences</div>
+          <div className="space-y-1">
+            {managedOnlyCount > 0 && (
+              <div className="flex items-center gap-2 px-1.5 py-1 text-xs text-theme-text-secondary">
+                <DeploymentSourceLogo source={deploymentSource} />
+                <span className="min-w-0 flex-1">
+                  <span className="block">{managedOnlyCount} only in {sourceLabel}</span>
+                  {deploymentLayer?.managedOnlySummary && (
+                    <span className="mt-0.5 block text-[10px] text-theme-text-tertiary">{deploymentLayer.managedOnlySummary}</span>
+                  )}
+                </span>
+                {onOpenSource && (
+                  <Tooltip content={`Open ${sourceLabel} view`} delay={150}>
+                    <button type="button" onClick={() => onOpenSource(deploymentSource)} className="rounded p-0.5 text-theme-text-tertiary hover:bg-theme-hover hover:text-theme-text-primary">
+                      <ExternalLink className="h-3 w-3" aria-hidden />
+                    </button>
+                  </Tooltip>
+                )}
+              </div>
+            )}
+            {runtimeOnlyCount > 0 && (
+              <div className="flex items-center gap-2 px-1.5 py-1 text-xs text-theme-text-secondary">
+                <Radio className="h-3.5 w-3.5 shrink-0 text-theme-text-tertiary" aria-hidden />
+                <span>{pluralize(runtimeOnlyCount, 'runtime-only resource')}</span>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
+}
+
+function DeploymentSourceLogo({ source }: { source: AppSourceRef }) {
+  const sourceLabel = sourceInventoryLabel(source)
+  const logo = sourceLabel === 'Argo CD' ? argoCdLogo : sourceLabel === 'Flux' ? fluxLogo : null
+  if (!logo) return <Layers className="h-3.5 w-3.5 shrink-0 text-theme-text-tertiary" aria-hidden />
+  return <img src={logo} alt="" className="h-4 w-4 shrink-0 object-contain" />
 }
 
 function StaticWorkloadScope({ workload }: { workload: AppWorkload }) {
