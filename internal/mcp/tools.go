@@ -342,14 +342,16 @@ func registerTools(server *mcp.Server, includeWrites bool) {
 			"attached it. It lists recent spec/config changes that may explain failures " +
 			"not yet visible as runtime issues, or help distinguish creation-time " +
 			"baseline failures from the active incident. " +
-			"Single-namespace responses additionally correlate changes PER critical issue: " +
-			"`correlated_changes` lists recent non-status changes on that issue's subject " +
-			"(and its referenced ConfigMaps); `no_recent_changes.window_seconds` states the " +
-			"subject had NO tracked changes in that window — strong evidence the issue is " +
-			"chronic rather than change-driven. An issue with neither marker was not " +
-			"checked (see `correlation_truncated`) — never read absence as 'no changes'. " +
-			"ConfigMap change entries carry `consumed_by` (workloads that mount/reference " +
-			"them directly). " +
+			"Single-namespace responses may add per-issue change evidence to eligible " +
+			"critical and warning issues: `correlated_changes` lists recent non-status " +
+			"changes on the issue subject (and, for workloads, its directly referenced " +
+			"ConfigMaps); `no_recent_changes.window_seconds` means Radar observed no such " +
+			"tracked change in that window. Treat that as evidence against, not disproof " +
+			"of, a recent tracked-change cause — Secret values and external dependencies " +
+			"may still have changed. If neither field is present, correlation is unknown, " +
+			"not 'no changes'. " +
+			"When present on a ConfigMap change, `consumed_by` identifies workloads that " +
+			"directly reference it. " +
 			"For raw Kubernetes Warning events use get_events; for static best-practice / " +
 			"security-posture findings (runAsRoot, missing PDB, no probes, missing resource " +
 			"limits) use get_cluster_audit — a separate axis that must never be conflated (a " +
@@ -2652,9 +2654,10 @@ func handleIssuesTool(ctx context.Context, _ *mcp.CallToolRequest, input issuesI
 		}
 	}
 	// Per-issue change correlation (single-namespace responses): each
-	// critical issue carries either its correlated non-status changes or an
-	// explicit no_recent_changes marker — deterministic per-subject evidence
-	// the global recent_changes list can't bind to individual issues.
+	// critical and warning issue (criticals first under a shared cap)
+	// carries either its correlated non-status changes or an explicit
+	// no_recent_changes marker — deterministic per-subject evidence the
+	// global recent_changes list can't bind to individual issues.
 	if len(allowedNamespaces) == 1 {
 		attachIssueChangeCorrelation(ctx, &resp)
 	}

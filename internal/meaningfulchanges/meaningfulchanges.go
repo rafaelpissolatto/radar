@@ -78,7 +78,7 @@ func recent(ctx context.Context, q Query) ([]issuesapi.RecentChange, bool, bool,
 
 	if len(q.Kinds) > 0 || q.Name != "" {
 		queryLimit := candidateLimit(q.Limit, q.Name != "")
-		events, err := queryCandidates(ctx, store, q, q.Kinds, queryLimit)
+		events, rawEvents, err := queryCandidates(ctx, store, q, q.Kinds, queryLimit)
 		if err != nil {
 			return nil, false, false, err
 		}
@@ -86,33 +86,33 @@ func recent(ctx context.Context, q Query) ([]issuesapi.RecentChange, bool, bool,
 		// update churn can't push them out of the newest-N candidate window
 		// before ranking ever sees them. Ranking scores deletes above status
 		// churn, but it can only rank what the fetch returns.
-		lifecycleEvents, err := queryLifecycleCandidates(ctx, store, q, q.Kinds)
+		lifecycleEvents, rawLifecycle, err := queryLifecycleCandidates(ctx, store, q, q.Kinds)
 		if err != nil {
 			return nil, false, false, err
 		}
 		changes, capped, err := rankedChanges(coalesceRecreatePairs(dedupeEvents(append(events, lifecycleEvents...))), q.Name, q.Limit, q.FieldLimit)
-		saturated := len(events) >= queryLimit || len(lifecycleEvents) >= lifecycleCandidateLimit
+		saturated := rawEvents >= queryLimit || rawLifecycle >= lifecycleCandidateLimit
 		return changes, capped, saturated, err
 	}
 
 	perQueryLimit := candidateLimit(q.Limit, false)
-	configEvents, err := queryCandidates(ctx, store, q, configKinds, perQueryLimit)
+	configEvents, rawConfig, err := queryCandidates(ctx, store, q, configKinds, perQueryLimit)
 	if err != nil {
 		return nil, false, false, err
 	}
-	specEvents, err := queryCandidates(ctx, store, q, specKinds, perQueryLimit)
+	specEvents, rawSpec, err := queryCandidates(ctx, store, q, specKinds, perQueryLimit)
 	if err != nil {
 		return nil, false, false, err
 	}
 	lifecycleKinds := append(append([]string{}, configKinds...), specKinds...)
 	lifecycleKinds = append(lifecycleKinds, lifecycleOnlyKinds...)
-	lifecycleEvents, err := queryLifecycleCandidates(ctx, store, q, lifecycleKinds)
+	lifecycleEvents, rawLifecycle, err := queryLifecycleCandidates(ctx, store, q, lifecycleKinds)
 	if err != nil {
 		return nil, false, false, err
 	}
 	merged := coalesceRecreatePairs(dedupeEvents(append(append(configEvents, specEvents...), lifecycleEvents...)))
 	changes, capped, err := rankedChanges(merged, "", q.Limit, q.FieldLimit)
-	saturated := len(configEvents) >= perQueryLimit || len(specEvents) >= perQueryLimit || len(lifecycleEvents) >= lifecycleCandidateLimit
+	saturated := rawConfig >= perQueryLimit || rawSpec >= perQueryLimit || rawLifecycle >= lifecycleCandidateLimit
 	return changes, capped, saturated, err
 }
 
@@ -289,7 +289,12 @@ const lifecycleCandidateLimit = 50
 
 // queryLifecycleCandidates fetches add/delete events for the given kinds in a
 // query of their own, immune to crowding by update events.
-func queryLifecycleCandidates(ctx context.Context, store timeline.EventStore, q Query, kinds []string) ([]timeline.TimelineEvent, error) {
+// queryLifecycleCandidates returns group-filtered events plus the RAW
+// pre-filter count — saturation must key on how many events the bounded
+// query consumed, not how many survived filtering, or mismatched-group
+// events crowding the window would turn "unknown" into a false "no
+// changes".
+func queryLifecycleCandidates(ctx context.Context, store timeline.EventStore, q Query, kinds []string) ([]timeline.TimelineEvent, int, error) {
 	opts := timeline.QueryOptions{
 		Namespaces:       q.Namespaces,
 		Kinds:            compactKinds(kinds),
@@ -302,10 +307,13 @@ func queryLifecycleCandidates(ctx context.Context, store timeline.EventStore, q 
 		IncludeManaged:   false,
 		IncludeK8sEvents: false,
 	}
-	return store.Query(ctx, opts)
+	events, err := store.Query(ctx, opts)
+	return filterTrackedGroupEvents(events), len(events), err
 }
 
-func queryCandidates(ctx context.Context, store timeline.EventStore, q Query, kinds []string, limit int) ([]timeline.TimelineEvent, error) {
+// queryCandidates returns group-filtered events plus the RAW pre-filter
+// count (see queryLifecycleCandidates for why saturation needs it).
+func queryCandidates(ctx context.Context, store timeline.EventStore, q Query, kinds []string, limit int) ([]timeline.TimelineEvent, int, error) {
 	opts := timeline.QueryOptions{
 		Namespaces: q.Namespaces,
 		Kinds:      compactKinds(kinds),
@@ -320,7 +328,38 @@ func queryCandidates(ctx context.Context, store timeline.EventStore, q Query, ki
 		IncludeManaged:   false,
 		IncludeK8sEvents: false,
 	}
-	return store.Query(ctx, opts)
+	events, err := store.Query(ctx, opts)
+	return filterTrackedGroupEvents(events), len(events), err
+}
+
+// filterTrackedGroupEvents drops candidate events recorded from a different
+// API group than the one the feed tracks for that kind — kind strings are
+// queried by name, so without this a Knative Service event would enter a
+// core Service's candidate set (and vice versa). Events with no recorded
+// apiVersion are kept: unknown, not mismatched.
+func filterTrackedGroupEvents(events []timeline.TimelineEvent) []timeline.TimelineEvent {
+	out := events[:0]
+	for _, e := range events {
+		if eventGroupMatchesTracked(e.Kind, e.APIVersion) {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+func eventGroupMatchesTracked(kind, apiVersion string) bool {
+	if apiVersion == "" {
+		return true // emitter did not record it — unknown, not mismatched
+	}
+	expected, ok := trackedKindGroups[canonicalKind(kind)]
+	if !ok {
+		return true
+	}
+	group := "" // bare "v1" = core group
+	if idx := strings.IndexByte(apiVersion, '/'); idx > 0 {
+		group = apiVersion[:idx]
+	}
+	return group == expected
 }
 
 func rankedChanges(events []timeline.TimelineEvent, name string, limit, fieldLimit int) ([]issuesapi.RecentChange, bool, error) {
@@ -432,6 +471,45 @@ func consumersOfConfigMap(cache *k8s.ResourceCache, namespace, name string) []st
 func TrackedKind(kind string) bool {
 	kind = canonicalKind(kind)
 	return isConfigKind(kind) || isSpecKind(kind)
+}
+
+// trackedKindGroups maps each tracked (canonical) kind to the API group the
+// feed actually records it from. Kind strings collide across groups — a
+// Knative Service (serving.knative.dev) is not the core Service whose
+// changes the feed tracks.
+// NOTE: this map must cover exactly TrackedKind's set (configKinds +
+// specKinds) — no lifecycleOnlyKinds. Secret is delete-only in the feed
+// (updates are never recorded), so making Secret issues marker-eligible
+// would emit a false no_recent_changes after a data rotation the feed
+// cannot see. The drift-guard test pins both directions.
+var trackedKindGroups = map[string]string{
+	"ConfigMap": "", "Service": "", "ResourceQuota": "", "LimitRange": "",
+	"Deployment": "apps", "StatefulSet": "apps", "DaemonSet": "apps",
+	"Ingress":                        "networking.k8s.io",
+	"HorizontalPodAutoscaler":        "autoscaling",
+	"Application":                    "argoproj.io",
+	"Kustomization":                  "kustomize.toolkit.fluxcd.io",
+	"HelmRelease":                    "helm.toolkit.fluxcd.io",
+	"GitRepository":                  "source.toolkit.fluxcd.io",
+	"OCIRepository":                  "source.toolkit.fluxcd.io",
+	"HelmRepository":                 "source.toolkit.fluxcd.io",
+	"MutatingWebhookConfiguration":   "admissionregistration.k8s.io",
+	"ValidatingWebhookConfiguration": "admissionregistration.k8s.io",
+}
+
+// TrackedKindForGroup is TrackedKind with kind-collision protection: when
+// the caller KNOWS the subject's API group and it differs from the group the
+// feed records for that kind, the subject is NOT tracked — correlating a
+// Knative Service against the same-named core Service's changes would
+// attach another resource's history to the issue. An empty group is
+// permissive (unknown ⇒ current behavior).
+func TrackedKindForGroup(kind, group string) bool {
+	kind = canonicalKind(kind)
+	expected, ok := trackedKindGroups[kind]
+	if !ok {
+		return false
+	}
+	return group == "" || group == expected
 }
 
 func RankAndCap(changes *[]issuesapi.RecentChange, limit int) {
