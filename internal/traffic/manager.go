@@ -98,6 +98,7 @@ func InitializeWithConfig(client kubernetes.Interface, config *rest.Config, cont
 		caretta.headers = metricsHeaders
 		manager.sources["caretta"] = caretta
 		manager.sources["istio"] = NewIstioSource(client)
+		manager.sources["beyla"] = NewBeylaSource(client)
 
 		// Set K8s clients for port-forward functionality
 		if config != nil {
@@ -132,8 +133,8 @@ func (m *Manager) DetectSources(ctx context.Context) (*SourcesResponse, error) {
 	}
 
 	// Check each registered source in deterministic priority order
-	// (hubble has deepest visibility, istio has L7 metrics, caretta is fallback)
-	sourceOrder := []string{"hubble", "istio", "caretta"}
+	// (hubble has deepest visibility, istio has L7 metrics, caretta is fallback, beyla is external eBPF)
+	sourceOrder := []string{"hubble", "istio", "caretta", "beyla"}
 	for _, name := range sourceOrder {
 		source, ok := m.sources[name]
 		if !ok {
@@ -541,6 +542,8 @@ func (m *Manager) Connect(ctx context.Context) (*portforward.ConnectionInfo, err
 	case *HubbleSource:
 		return s.Connect(ctx, contextName)
 	case *IstioSource:
+		return s.Connect(ctx, contextName)
+	case *BeylaSource:
 		return s.Connect(ctx, contextName)
 	default:
 		// For sources without Connect support, just report connected.
